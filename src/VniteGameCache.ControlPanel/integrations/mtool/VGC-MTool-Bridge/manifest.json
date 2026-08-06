@@ -1,0 +1,13 @@
+{
+  "id": "vgc-mtool-bridge",
+  "name": "VGC MTool Bridge",
+  "bridgeVersion": "1.0.0",
+  "protocolVersion": 1,
+  "entry": "bridge.js",
+  "probe": "probe.js",
+  "requiredFlags": ["@AutoLoad"],
+  "forbiddenEngineFlags": ["@EvalV8", "@EvalRGSS", "@EvalPy", "@EvalPyFile", "@EvalSrpgStudio", "@EvalAgtk", "@EvalKrkr"],
+  "writesMToolGameLib": false,
+  "modifiesGameFiles": false,
+  "requiredCapabilities": ["getGameCWD"]
+}

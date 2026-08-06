@@ -1,0 +1,289 @@
+{
+  "id": "vnite-game-cache",
+  "name": "Vnite 游戏缓存",
+  "version": "0.2.8",
+  "description": "将 NAS/HDD 游戏自动缓存到本地 SSD，并通过 Wrapper 启动。",
+  "author": "Vnite 游戏缓存",
+  "license": "MIT",
+  "vniteVersion": "^4.0.0-beta.2",
+  "main": "index.js",
+  "keywords": ["vnite-plugin", "cache", "launcher"],
+  "category": "common",
+  "configuration": [
+    {
+      "id": "wrapperLauncherPath",
+      "title": "Wrapper 启动器路径",
+      "default": "",
+      "description": "选择 VniteGameCache.Wrapper.exe 或 VniteGameCache.Wrapper.dll。",
+      "type": "file",
+      "controlOptions": {
+        "controlType": "fileinput",
+        "placeholder": "选择 Wrapper 启动器"
+      }
+    },
+    {
+      "id": "agentStubPath",
+      "title": "Agent 路径",
+      "default": "",
+      "description": "选择 VniteGameCache.Agent.exe。",
+      "type": "file",
+      "controlOptions": {
+        "controlType": "fileinput",
+        "placeholder": "选择 Agent"
+      }
+    },
+    {
+      "id": "libraryRoot",
+      "title": "NAS 游戏库根目录",
+      "default": "",
+      "description": "NAS/HDD 游戏库根目录。会按扫描层级查找游戏目录，例如 \\\\NAS-SERVER\\Games。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "\\\\NAS-SERVER\\Games"
+      }
+    },
+    {
+      "id": "libraryScanDepth",
+      "title": "游戏目录扫描层级",
+      "default": 3,
+      "description": "从游戏库根目录向下扫描的最大层级，支持 1 到 3。适合 分类/作者/游戏 这类目录结构。",
+      "type": "number",
+      "controlOptions": {
+        "controlType": "input",
+        "placeholder": "3"
+      }
+    },
+    {
+      "id": "defaultCacheRoot",
+      "title": "默认 SSD 缓存根目录",
+      "default": "",
+      "description": "本地 SSD 缓存根目录。每个游戏会生成独立缓存目录。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "D:\\VniteGameCache\\Games"
+      }
+    },
+    {
+      "id": "defaultLaunchMode",
+      "title": "默认启动模式",
+      "default": "Direct",
+      "description": "直接启动保持默认。可选优先启动翻译 EXE，或在缓存完成后使用已识别的 MTool 批处理模板。",
+      "type": "select",
+      "options": [
+        { "label": "直接启动", "value": "Direct" },
+        { "label": "翻译 EXE 优先", "value": "TranslationPreferred" },
+        { "label": "MTool 批处理优先", "value": "MTool" }
+      ],
+      "controlOptions": {
+        "controlType": "select",
+        "placeholder": "Direct"
+      }
+    },
+    {
+      "id": "mtoolExecutablePath",
+      "title": "MTool 路径",
+      "default": "",
+      "description": "MTool 批处理优先模式使用此安装目录内当前版本的 inject.exe、Loader DLL 和 nw.exe；不会修改 NAS 原文件或 MTool 私有游戏库。",
+      "type": "file",
+      "controlOptions": {
+        "controlType": "fileinput",
+        "placeholder": "选择 MTool.exe"
+      }
+    },
+    {
+      "id": "launcherShortcutRoot",
+      "title": "启动快捷方式目录",
+      "default": "",
+      "description": "保存每个游戏的 Wrapper .lnk 快捷方式。留空使用 %LOCALAPPDATA%\\VniteGameCache\\launchers。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "C:\\Users\\You\\AppData\\Local\\VniteGameCache\\launchers"
+      }
+    },
+    {
+      "id": "existingVniteAdoptRoots",
+      "title": "接管已有 Vnite 游戏根目录",
+      "default": "",
+      "description": "批量接管 Vnite 已有文件启动项时允许处理的根目录。可用分号或换行填写多个，例如 G:\\Games；留空时仍会使用 NAS 游戏库根目录。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "G:\\Games;\\\\NAS-SERVER\\Games"
+      }
+    },
+    {
+      "id": "autoAdoptExistingOnActivate",
+      "title": "启用后自动接管已有游戏",
+      "default": true,
+      "description": "开启后，插件启动时校验一次，并优先响应 Vnite 新增游戏事件；每 15 分钟低频兜底检查。不会修改标题、封面、标签等元数据。",
+      "type": "boolean",
+      "controlOptions": {
+        "controlType": "switch"
+      }
+    },
+    {
+      "id": "autoAdoptBatchSize",
+      "title": "自动接管每批数量",
+      "default": 25,
+      "description": "每次后台自动接管的最大游戏数量。建议 10 到 50，避免 Vnite 启动时一次性改太多条目。",
+      "type": "number",
+      "controlOptions": {
+        "controlType": "input",
+        "placeholder": "5"
+      }
+    },
+    {
+      "id": "controlPanelPath",
+      "title": "VGC 控制台路径",
+      "default": "",
+      "description": "可选。留空时自动使用 Agent 同目录下的 VniteGameCache.ControlPanel.exe。",
+      "type": "file",
+      "controlOptions": {
+        "controlType": "fileinput",
+        "placeholder": "选择 VniteGameCache.ControlPanel.exe"
+      }
+    },
+    {
+      "id": "registerToolboxShortcuts",
+      "title": "注册工具箱快捷入口",
+      "default": true,
+      "description": "在 Vnite 4.12+ 工具箱中自动加入 VGC 控制台、缓存目录、日志目录和项目目录快捷入口。",
+      "type": "boolean",
+      "controlOptions": {
+        "controlType": "switch"
+      }
+    },
+    {
+      "id": "cacheMaxTotalMb",
+      "title": "缓存容量上限（MB）",
+      "default": 0,
+      "description": "缓存清理目标，单位 MB。0 表示不限制总容量；自动清理会结合最低剩余空间一起判断。",
+      "type": "number",
+      "controlOptions": {
+        "controlType": "input",
+        "placeholder": "512000"
+      }
+    },
+    {
+      "id": "autoCleanupOnThreshold",
+      "title": "超过上限自动清理安全缓存",
+      "default": false,
+      "description": "开启后，当容量或剩余空间触发阈值时，删除可从 NAS 重新生成的游戏本体，只保留已识别的用户数据。不会清理 pinned、运行中或任务中的游戏。",
+      "type": "boolean",
+      "controlOptions": {
+        "controlType": "switch"
+      }
+    },
+    {
+      "id": "autoCleanupMaxItemsPerRun",
+      "title": "每次自动清理最多游戏数",
+      "default": 2,
+      "description": "自动清理每轮最多处理的游戏数量，避免一次清理过多。",
+      "type": "number",
+      "controlOptions": {
+        "controlType": "input",
+        "placeholder": "2"
+      }
+    },
+    {
+      "id": "minimumFreeSpaceMb",
+      "title": "最低剩余空间（MB）",
+      "default": 10240,
+      "description": "缓存复制和自动清理都会使用此阈值，单位 MB。0 表示不限制最低剩余空间。",
+      "type": "number",
+      "controlOptions": {
+        "controlType": "input",
+        "placeholder": "10240"
+      }
+    },
+    {
+      "id": "quarantineRetentionDays",
+      "title": "隔离区保留天数",
+      "default": 30,
+      "description": "手动清除或自动清理保留的用户数据在隔离区的保留天数。0 表示永不自动永久删除。",
+      "type": "number",
+      "controlOptions": {
+        "controlType": "input",
+        "placeholder": "30"
+      }
+    },
+    {
+      "id": "protectConfigFiles",
+      "title": "保护配置/截图/Mod 目录",
+      "default": false,
+      "description": "默认关闭。开启后，清理或重建缓存时检测 config、screenshots、mods 等目录并按用户数据风险处理。存档目录始终会保护。",
+      "type": "boolean",
+      "controlOptions": {
+        "controlType": "switch"
+      }
+    },
+    {
+      "id": "defaultSaveBackupRoot",
+      "title": "默认存档备份目录",
+      "default": "",
+      "description": "手动存档备份的默认目录。留空使用 %LOCALAPPDATA%\\VniteGameCache\\saves。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "D:\\VniteGameCache\\SaveBackups"
+      }
+    },
+    {
+      "id": "testExecutablePath",
+      "title": "测试程序路径",
+      "default": "",
+      "description": "用于链路验证的 TestGame.exe 路径。",
+      "type": "file",
+      "controlOptions": {
+        "controlType": "fileinput",
+        "placeholder": "选择 TestGame"
+      }
+    },
+    {
+      "id": "testWorkingDirectory",
+      "title": "测试工作目录",
+      "default": "",
+      "description": "传给 Wrapper 的测试工作目录。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "C:\\Temp"
+      }
+    },
+    {
+      "id": "testArgumentsRaw",
+      "title": "测试参数",
+      "default": "--sleep-ms 700 --message \"hello from Vnite\"",
+      "description": "用于 TestGame 链路验证的参数。",
+      "type": "string",
+      "controlOptions": {
+        "controlType": "input",
+        "inputType": "text",
+        "placeholder": "--sleep-ms 700 --message \"hello\""
+      }
+    },
+    {
+      "id": "autoRunValidationOnActivate",
+      "title": "插件启用后自动验证",
+      "default": false,
+      "description": "Vnite 启用插件时自动运行一次测试链路。日常使用建议关闭。",
+      "type": "boolean",
+      "controlOptions": {
+        "controlType": "switch"
+      }
+    }
+  ],
+  "scripts": {
+    "build": "node --check index.js",
+    "test": "node --check index.js"
+  }
+}

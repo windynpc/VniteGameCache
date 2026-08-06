@@ -1,0 +1,35 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+*.pdb
+
+# Node
+**/node_modules/
+npm-debug.log*
+
+# Build and release output
+/artifacts/
+/release/
+/dist/
+
+# Local runtime state
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.lnk
+settings.json
+
+# IDE and OS
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local backups
+*.bak
+*.bak-*
+*~

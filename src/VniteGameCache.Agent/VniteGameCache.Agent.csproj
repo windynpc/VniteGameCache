@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\VniteGameCache.Contracts\VniteGameCache.Contracts.csproj" />
+    <ProjectReference Include="..\VniteGameCache.Persistence\VniteGameCache.Persistence.csproj" />
+    <ProjectReference Include="..\VniteGameCache.Indexing\VniteGameCache.Indexing.csproj" />
+    <ProjectReference Include="..\VniteGameCache.Caching\VniteGameCache.Caching.csproj" />
+    <ProjectReference Include="..\VniteGameCache.LibraryImport\VniteGameCache.LibraryImport.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

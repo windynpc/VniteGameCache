@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\VniteGameCache.Contracts\VniteGameCache.Contracts.csproj" />
+    <ProjectReference Include="..\VniteGameCache.Caching\VniteGameCache.Caching.csproj" />
+    <ProjectReference Include="..\VniteGameCache.Persistence\VniteGameCache.Persistence.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+
+  <ItemGroup>
+    <Content Include="integrations\mtool\VGC-MTool-Bridge\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
+

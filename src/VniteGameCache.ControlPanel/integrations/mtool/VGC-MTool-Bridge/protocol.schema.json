@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VGC MTool Bridge Response",
+  "type": "object",
+  "required": ["protocolVersion", "bridgeVersion", "capabilities"],
+  "properties": {
+    "protocolVersion": { "type": "integer", "const": 1 },
+    "bridgeVersion": { "type": "string" },
+    "capabilities": { "type": "array", "items": { "type": "string" } },
+    "gameCwd": { "type": ["string", "null"] },
+    "error": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Restore
+        run: dotnet restore VniteGameCache.sln
+
+      - name: Build
+        run: dotnet build VniteGameCache.sln -c Release --no-restore
+
+      - name: Test .NET
+        run: dotnet test VniteGameCache.sln -c Release --no-build
+
+      - name: Test plugin
+        working-directory: src/VniteGameCache.Plugin
+        run: |
+          npm test
+          npm run build
