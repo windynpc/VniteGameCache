@@ -1,3 +1,4 @@
+using VniteGameCache.Contracts;
 using VniteGameCache.Persistence;
 using System.Text.Json;
 
@@ -16,6 +17,7 @@ public sealed class CacheService(
         var taskId = $"prepare-cache-{request.RequestId:N}";
         GameRecord? game = null;
         CopyPlan? plan = null;
+        string? logDirectory = null;
 
         try
         {
@@ -70,6 +72,7 @@ public sealed class CacheService(
             cancellationToken.ThrowIfCancellationRequested();
             store.MarkCopying(taskId);
             var command = commandBuilder.Build(plan);
+            logDirectory = Path.GetDirectoryName(command.LogPath);
             var existingProgress = CalculateExistingProgress(plan, files);
             store.UpdateTaskProgress(taskId, existingProgress.Bytes, plan.EstimatedTotalBytes);
             var latestProgress = new CacheProgress(
@@ -193,6 +196,10 @@ public sealed class CacheService(
         {
             if (game is not null) store.MarkTask(taskId, TaskState.Failed, "unexpected_error", error.Message);
             return Failure(CacheResultStatus.UnexpectedError, game?.GameId ?? request.GameId, "unexpected_error", error.Message, plan, false, null);
+        }
+        finally
+        {
+            if (logDirectory is not null) LogRetention.Trim(LogRetention.Roots(logDirectory));
         }
     }
 

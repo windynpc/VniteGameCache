@@ -31,7 +31,7 @@ Vnite
 
 ## 当前状态
 
-当前公开版本为 `0.2.8-beta.1`。核心缓存与接管链路已在真实 Vnite 环境
+当前公开版本为 `0.2.9-beta.1`。核心缓存与接管链路已在真实 Vnite 环境
 验证，但仍属于 Beta，请先使用少量游戏验证配置，不要直接对整个游戏库
 执行批量清理。
 
@@ -106,14 +106,14 @@ Pop-Location
 生成 Windows 发布包：
 
 ```powershell
-.\scripts\build-release.ps1 -Version 0.2.8-beta.1
+.\scripts\build-release.ps1 -Version 0.2.9-beta.1
 ```
 
 如果 `dotnet` 不在 `PATH`：
 
 ```powershell
 .\scripts\build-release.ps1 `
-  -Version 0.2.8-beta.1 `
+  -Version 0.2.9-beta.1 `
   -DotNetPath C:\path\to\dotnet.exe
 ```
 

@@ -1,7 +1,7 @@
 {
   "id": "vnite-game-cache",
   "name": "Vnite 游戏缓存",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "将 NAS/HDD 游戏自动缓存到本地 SSD，并通过 Wrapper 启动。",
   "author": "Vnite 游戏缓存",
   "license": "MIT",
@@ -284,6 +284,6 @@
   ],
   "scripts": {
     "build": "node --check index.js",
-    "test": "node --check index.js"
+    "test": "node --check index.js && node ../../tests/plugin-executable-detection.test.js && node ../../tests/plugin-log-retention.test.js"
   }
 }

@@ -3379,22 +3379,76 @@ function parseWindowsArgs(input) {
   return args
 }
 
+const maximumLogTotalBytes = 500 * 1024 * 1024
+const maximumLogFileBytes = 10 * 1024 * 1024
+
+function trimLogs(roots, maximumBytes = maximumLogTotalBytes) {
+  const files = new Map()
+  function scan(root) {
+    try {
+      const rootStat = fs.lstatSync(root)
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        const filePath = path.join(root, entry.name)
+        if (entry.isSymbolicLink()) continue
+        if (entry.isDirectory()) {
+          scan(filePath)
+        } else if (entry.isFile() && (
+          entry.name === 'vnite-game-cache.jsonl' ||
+          /^\d{8}(?:\.plugin)?(?:\.[a-f0-9]+)?\.jsonl$/i.test(entry.name) ||
+          /\.robocopy\.log(?:\.progress\.json)?$/i.test(entry.name)
+        )) {
+          try {
+            const stat = fs.statSync(filePath)
+            files.set(path.resolve(filePath), { filePath, size: stat.size, modified: stat.mtimeMs })
+          } catch { /* A concurrent logger may have rotated this file. */ }
+        }
+      }
+    } catch { /* Missing or inaccessible directories are retried on the next write. */ }
+  }
+  for (const root of new Set(roots)) scan(root)
+  let total = [...files.values()].reduce((sum, file) => sum + file.size, 0)
+  for (const file of [...files.values()].sort((a, b) => a.modified - b.modified || a.filePath.localeCompare(b.filePath))) {
+    if (total <= maximumBytes) break
+    try {
+      fs.unlinkSync(file.filePath)
+      total -= file.size
+    } catch { /* Locked files are retried on the next write. */ }
+  }
+}
+
+function appendLog(filePath, line, roots, maximumBytes = maximumLogTotalBytes, fileLimit = maximumLogFileBytes) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size + Buffer.byteLength(line, 'utf8') > fileLimit) {
+      fs.renameSync(filePath, filePath.replace(/\.jsonl$/, `.${crypto.randomUUID().replace(/-/g, '')}.jsonl`))
+    }
+    fs.appendFileSync(filePath, line, 'utf8')
+  } catch { /* Logging must not interrupt plugin actions. */ }
+  trimLogs(roots, maximumBytes)
+}
+
 async function log(event, data) {
-  const logDir = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'VniteGameCache', 'plugin')
-  fs.mkdirSync(logDir, { recursive: true })
+  const root = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'VniteGameCache')
+  const logDir = path.join(root, 'plugin')
   const entry = {
     timestamp_utc: new Date().toISOString(),
     component: 'vnite-plugin',
     event,
     ...data
   }
-  fs.appendFileSync(path.join(logDir, 'vnite-game-cache.jsonl'), JSON.stringify(entry) + os.EOL, 'utf8')
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+  appendLog(path.join(logDir, `${day}.plugin.jsonl`), JSON.stringify(entry) + os.EOL,
+    [logDir, path.join(root, 'logs')])
 }
 
 module.exports = {
   activate,
   deactivate,
   __test: {
+    trimLogs,
+    appendLog,
+    maximumLogTotalBytes,
     detectExecutableInDirectory,
     scoreExecutableCandidate,
     resolveAdoptLaunchSource,
