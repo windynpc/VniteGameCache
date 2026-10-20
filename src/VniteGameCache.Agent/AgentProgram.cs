@@ -700,7 +700,6 @@ public static class AgentProgram
         var maxBytes = long.TryParse(ReadOption(args, "--max-total-cache-bytes"), out var parsedMax) ? parsedMax : (long?)null;
         var minFree = long.TryParse(ReadOption(args, "--minimum-free-space-bytes"), out var parsedFree) ? parsedFree : (long?)null;
         var service = CreateCacheManagementService(factory, ReadMinimumFreeSpace(args));
-        service.CleanupExpiredQuarantine(ReadQuarantineRetentionDays(args));
         var result = service.PlanCleanup(new CacheCleanupOptions(maxBytes, minFree));
         await WriteJsonAsync(new { auto_apply = false, candidates = result.Candidates, result });
         return 0;
