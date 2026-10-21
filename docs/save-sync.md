@@ -89,3 +89,11 @@ Import and restore always create an automatic backup of the current target first
 For non-absolute source types, `path_template` must resolve inside its configured root. Templates that escape with `..` or rooted paths are rejected. Adding the same resolved path for the same game updates the existing Save Profile instead of creating duplicates.
 
 Automatic exit-time sync, NAS write-back queues, and conflict merge remain future work.
+
+## Vnite 4.14 自动备份与 VGC Save Profiles
+
+Vnite 4.14 支持逐游戏关闭自身的自动存档备份；一次会话的游玩记录若全部因时长过短被忽略，Vnite 也不会触发该自动备份。此开关只控制 Vnite 的原生备份流程。
+
+VGC Save Profiles 是独立的手动操作：用户在 VGC 中选择备份、导入、导出或恢复时才运行；导入和恢复前会备份当前目标存档。VGC 不根据 Vnite 的逐游戏开关启停这些操作，也不调用 Vnite 原生的 `game:backup-save` IPC。当前插件 API 未提供可安全调用该 IPC 的 `invoke` 方法。
+
+VGC 接管现有游戏时保留 Vnite local doc 中的 `path.savePaths` 等非启动字段，不会改动 Vnite 的自动备份设置。两套备份的目录和保留策略各自管理；VGC 自动双向存档同步尚未实现。
