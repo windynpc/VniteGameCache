@@ -132,3 +132,9 @@ Pop-Location
 ## License
 
 MIT。第三方组件见 `THIRD-PARTY-NOTICES.md`。
+
+## Vnite 4.14 兼容性（2026-10-21）
+
+本机 Vnite 4.14.0 下，0.2.9-beta.1 插件已正常激活，并从 Vnite 实际启动两款中文/日文路径游戏；Wrapper 和 Agent 均从当前发布目录运行，游戏进程位于 SSD 缓存目录。源码、发布插件和已安装插件的哈希已核对一致；插件测试及 118 项 .NET 测试通过。
+
+Vnite 逐游戏自动存档备份与 VGC 手动 Save Profiles 相互独立，详见 [存档说明](docs/save-sync.md)。中文路径游戏的 Vnite“停止游戏”按钮验收按用户要求暂停，不能据此宣称该按钮已兼容。本次只更新文档和本地发布包说明，程序二进制及原有 `v0.2.9-beta.1` 下载资产不变。
