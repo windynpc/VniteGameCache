@@ -28,7 +28,6 @@ public sealed class UiFeatureRegistryTests
             "suspend",
             "ignore",
             "unignore",
-            "reset_current",
             "delete_from_vnite",
             "change_source_root",
             "change_cache_root",
@@ -64,7 +63,7 @@ public sealed class UiFeatureRegistryTests
         var ignore = UiFeatureRegistry.Features.Single(feature => feature.Id == "ignore");
 
         Assert.NotEqual(delete.Id, ignore.Id);
-        Assert.Equal("删除插件记录", delete.Name);
+        Assert.Equal("仅删孤立 VGC 记录（高级）", delete.Name);
         Assert.Equal("永久忽略", ignore.Name);
         Assert.DoesNotContain("忽略", delete.PrimaryEntry);
         Assert.NotEqual(delete.PrimaryEntry, ignore.PrimaryEntry);
@@ -80,22 +79,22 @@ public sealed class UiFeatureRegistryTests
                      "清理 / 删除 ▼",
                      "清除缓存",
                      "删除插件记录",
-                     "一键清除接管属性",
-                     "清除后重新接管",
+                     "清除 VGC 启动设置（保留记录）",
+                     "清除后重新检测并接管",
                      "检查接管一致性",
                      "一键安全修复",
                      "批量重新接管",
-                     "仅删除插件记录",
-                     "删除插件记录并清除接管属性",
+                     "仅删孤立 VGC 记录（高级）",
+                     "解除 VGC 接管并删记录（保留缓存）",
                      "解除接管",
                      "永久忽略",
                      "取消忽略",
-                     "完全重置当前游戏",
                      "从 Vnite 删除（高级危险操作）"
                  })
         {
             Assert.Contains(label, source);
         }
+        Assert.DoesNotContain("完全重置当前游戏", source);
     }
 
     [Fact]
@@ -109,11 +108,10 @@ public sealed class UiFeatureRegistryTests
                      "批量扫描接管残留",
                      "批量清除接管属性",
                      "批量清除后重新接管",
-                     "批量删除插件记录并清除接管属性",
-                     "批量删除插件记录",
+                     "批量解除 VGC 接管并删记录",
+                     "批量仅删孤立 VGC 记录",
                      "批量解除接管",
                      "批量永久忽略",
-                     "批量完全重置"
                  })
         {
             Assert.Contains(label, source);

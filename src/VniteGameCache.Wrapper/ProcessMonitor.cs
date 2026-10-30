@@ -15,7 +15,8 @@ public sealed class ProcessMonitor
         TimeSpan stableExitDelay,
         CancellationToken cancellationToken,
         bool restrictDescendantsToExpectedRoot = false,
-        IReadOnlyList<string>? additionalExpectedExecutableRoots = null)
+        IReadOnlyList<string>? additionalExpectedExecutableRoots = null,
+        Func<bool>? hasActiveJobProcesses = null)
     {
         var observed = new HashSet<int> { initialProcess.Id };
         var trackedNames = additionalProcessNames
@@ -36,7 +37,7 @@ public sealed class ProcessMonitor
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var wasAliveBeforeDiscovery = observed.Any(IsProcessAlive);
+            var wasAliveBeforeDiscovery = observed.Any(IsProcessAlive) || hasActiveJobProcesses?.Invoke() == true;
             DiscoverChildrenAndNamedProcesses(
                 observed,
                 trackedNames,
@@ -46,7 +47,7 @@ public sealed class ProcessMonitor
                 wasAliveBeforeDiscovery || DateTimeOffset.UtcNow - lastSeenAliveUtc < stableExitDelay,
                 restrictDescendantsToExpectedRoot);
 
-            var alive = observed.Any(IsProcessAlive);
+            var alive = observed.Any(IsProcessAlive) || hasActiveJobProcesses?.Invoke() == true;
             if (alive)
             {
                 lastSeenAliveUtc = DateTimeOffset.UtcNow;

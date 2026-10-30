@@ -17,7 +17,8 @@ public sealed class MigrationRunner(SqliteConnectionFactory factory) : IMigratio
         new(1, "001_initial_schema", "Initial SQLite persistence schema", InitialSchemaSql),
         new(2, "002_phase6_productization", "Phase 6 cache management and manual save profiles", Phase6ProductizationSql),
         new(3, "003_recovery_reconciliation", "Recovery reconciliation schema", RecoveryReconciliationSql),
-        new(4, "004_executable_manager", "Executable manager launch candidates", ExecutableManagerSql)
+        new(4, "004_executable_manager", "Executable manager launch candidates", ExecutableManagerSql),
+        new(5, "005_archive_sources", "Archive-backed game source metadata", ArchiveSourcesSql)
     ];
 
     public void Initialize()
@@ -421,4 +422,17 @@ public sealed class MigrationRunner(SqliteConnectionFactory factory) : IMigratio
         CREATE INDEX idx_launch_candidates_game_score ON game_launch_candidates(game_id, is_ignored, score DESC, confidence DESC);
         """;
 
+    private const string ArchiveSourcesSql = """
+        CREATE TABLE archive_sources (
+          game_id TEXT PRIMARY KEY,
+          archive_path TEXT NOT NULL,
+          executable_relative_path TEXT NOT NULL,
+          expanded_bytes INTEGER NOT NULL CHECK(expanded_bytes >= 0),
+          file_count INTEGER NOT NULL CHECK(file_count > 0),
+          archive_size_bytes INTEGER NOT NULL CHECK(archive_size_bytes >= 0),
+          archive_last_write_utc TEXT NOT NULL,
+          FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX idx_archive_sources_path ON archive_sources(archive_path);
+        """;
 }

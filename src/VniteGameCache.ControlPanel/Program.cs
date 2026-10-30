@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Text;
@@ -7,6 +8,7 @@ using System.Windows.Forms;
 using Microsoft.Data.Sqlite;
 using VniteGameCache.Caching;
 using VniteGameCache.Contracts;
+using VniteGameCache.LibraryImport;
 using VniteGameCache.Persistence;
 
 namespace VniteGameCache.ControlPanel;
@@ -37,6 +39,7 @@ internal sealed class MainForm : Form
     private readonly Label _copyProgressStatus = new();
     private readonly DataGridView _gamesGrid = new();
     private readonly TextBox _detailsText = new();
+    private CancellationTokenSource? _sizeScanCancellation;
     private readonly TextBox _searchBox = new();
     private readonly ComboBox _viewFilter = new();
     private readonly ComboBox _managedFilter = new();
@@ -60,11 +63,16 @@ internal sealed class MainForm : Form
     private readonly string _pluginLogRoot = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "plugin");
     private readonly string _diagnosticsRoot = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "diagnostics");
     private readonly string _commandsRoot = VgcSettingsStore.ResolveCommandsRoot();
+    private DateTime _archiveDiscoveryLastWriteUtc;
     private readonly string _maintenanceModePath = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "config", "maintenance-mode.json");
     private readonly string _projectRoot = ResolveProjectRoot();
     private readonly string _uiConfigPath = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "config", "control-panel-ui.json");
     private readonly string _stateBackupRoot = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "backups", "state");
     private List<GameRow> _allRows = [];
+    private bool _archiveImportPending;
+    private int _translationScanVersion;
+    private readonly Dictionary<string, DateTimeOffset> _translationScanTimes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _manualTranslationScans = new(StringComparer.OrdinalIgnoreCase);
     private string? _lastUndoBackupPath;
 
     public MainForm(string[] args)
@@ -123,13 +131,28 @@ internal sealed class MainForm : Form
         root.Controls.Add(CreateStatusPanel());
         root.Controls.Add(CreateTabs());
         Controls.Add(root);
-        _progressTimer.Tick += (_, _) => _copyProgressStatus.Text = ReadLatestCopyProgress();
+        _progressTimer.Tick += (_, _) =>
+        {
+            _copyProgressStatus.Text = ReadLatestCopyProgress();
+            if (_archiveImportPending && IsArchiveImportComplete())
+            {
+                _archiveImportPending = false;
+                LoadStatus();
+            }
+            var discoveryPath = Path.Combine(_commandsRoot, "archive-discovery-result.json");
+            var discoveryWriteUtc = File.Exists(discoveryPath) ? File.GetLastWriteTimeUtc(discoveryPath) : DateTime.MinValue;
+            if (discoveryWriteUtc > _archiveDiscoveryLastWriteUtc)
+            {
+                _archiveDiscoveryLastWriteUtc = discoveryWriteUtc;
+                LoadStatus();
+            }
+        };
         _searchDebounceTimer.Tick += (_, _) =>
         {
             _searchDebounceTimer.Stop();
             ApplyGameFilters();
         };
-        FormClosed += (_, _) => _progressTimer.Stop();
+        FormClosed += (_, _) => { _progressTimer.Stop(); Interlocked.Increment(ref _translationScanVersion); };
 
         Shown += (_, _) =>
         {
@@ -139,6 +162,9 @@ internal sealed class MainForm : Form
             }
 
             LoadStatus();
+            _archiveImportPending = IsArchiveImportPending();
+            var discoveryPath = Path.Combine(_commandsRoot, "archive-discovery-result.json");
+            _archiveDiscoveryLastWriteUtc = File.Exists(discoveryPath) ? File.GetLastWriteTimeUtc(discoveryPath) : DateTime.MinValue;
             _progressTimer.Start();
 
             if (_startupArgs.Any(arg => arg.Equals("--cleanup", StringComparison.OrdinalIgnoreCase)))
@@ -312,10 +338,17 @@ internal sealed class MainForm : Form
         };
         buttons.Controls.Add(CreateButton("启动", (_, _) => LaunchSelectedGame()));
         buttons.Controls.Add(CreateButton("诊断", (_, _) => DiagnoseSelectedGame()));
+        buttons.Controls.Add(CreateButton("导出复制诊断", (_, _) => ExportSelectedCopyDiagnostics()));
+        buttons.Controls.Add(CreateButton("启动前预检", (_, _) => PreviewSelectedLaunch()));
         buttons.Controls.Add(CreateButton("自动修复", (_, _) => RequestAdoptRepair()));
         buttons.Controls.Add(CreateButton("手动修复", (_, _) => ManualRepairSelectedGame()));
         buttons.Controls.Add(CreateButton("启动程序", (_, _) => OpenExecutableManagerSelectedGame()));
         buttons.Controls.Add(CreateButton("立即缓存", (_, _) => PrepareSelectedGameCache()));
+        var sizeButton = CreateButton("核算实际占用", async (_, _) => await MeasureSelectedGameSizeAsync());
+        buttons.Controls.Add(sizeButton);
+        buttons.Controls.Add(CreateButton("导入压缩包", async (_, _) => await RequestArchiveImportAsync()));
+        buttons.Controls.Add(CreateButton("导入结果", (_, _) => ShowArchiveImportResult()));
+        buttons.Controls.Add(CreateButton("自动发现结果", (_, _) => ShowArchiveDiscoveryResult()));
         buttons.Controls.Add(CreateButton("清理 / 删除 ▼", (sender, _) =>
         {
             if (sender is Control control) ShowCleanupDeleteMenu(control);
@@ -354,11 +387,11 @@ internal sealed class MainForm : Form
             ("打开接管诊断", OpenAdoptDiagnosticsReport),
             ("打开接管残留诊断", OpenTakeoverResidueDiagnosticsReport),
             ("一键修复接管", RequestAdoptRepair),
-            ("一键清除接管属性", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false)),
-            ("清除后重新接管", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false)),
+            ("清除 VGC 启动设置（保留记录）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false)),
+            ("清除后重新检测并接管", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false)),
             ("扫描过期记录", ScanObsoleteRecords),
             ("扫描重复游戏", ScanDuplicateGames),
-            ("仅删除插件记录", DeleteSelectedRecord));
+            ("仅删孤立 VGC 记录（高级）", DeleteSelectedRecord));
         page.Controls.Add(CreatePageLayout(text, buttons));
         return page;
     }
@@ -471,6 +504,7 @@ internal sealed class MainForm : Form
         AddColumn(nameof(GameRow.AdoptStatus), "接管状态", 110);
         AddColumn(nameof(GameRow.CacheStatus), "缓存状态", 90);
         AddColumn(nameof(GameRow.LaunchMode), "启动模式", 100);
+        AddColumn(nameof(GameRow.TranslationStatus), "可翻译状态", 340);
         AddColumn(nameof(GameRow.Issue), "问题", 260);
         AddColumn(nameof(GameRow.LastPlayed), "最近游玩", 125);
         AddColumn(nameof(GameRow.CacheMb), "缓存大小(MB)", 110);
@@ -518,11 +552,10 @@ internal sealed class MainForm : Form
             AddCleanupMenuItem($"批量扫描接管残留（Dry Run，{selected.Count} 个）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: true), selected.Any(row => !IsRowRunning(row)));
             AddCleanupMenuItem($"批量清除接管属性（{selected.Count} 个）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false), selected.Any(row => !IsRowRunning(row)));
             AddCleanupMenuItem($"批量清除后重新接管（{selected.Count} 个）", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false), selected.Any(row => !IsRowRunning(row)));
-            AddCleanupMenuItem($"批量删除插件记录并清除接管属性（推荐，{selected.Count} 个）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false), selected.Any(row => !IsRowRunning(row)));
-            AddCleanupMenuItem($"批量仅删除插件记录（{selected.Count} 个）", BatchDeleteSelectedRecords, selected.Any(row => !IsRowRunning(row)));
+            AddCleanupMenuItem($"批量解除 VGC 接管并删记录（保留缓存，{selected.Count} 个）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false), selected.Any(row => !IsRowRunning(row)));
+            AddCleanupMenuItem($"批量仅删孤立 VGC 记录（高级，{selected.Count} 个）", BatchDeleteSelectedRecords, selected.Any(row => !IsRowRunning(row)));
             AddCleanupMenuItem($"批量解除接管（{selected.Count} 个）", () => BatchSetManagementIntent(ManagementIntent.Unmanaged), selected.Any(row => row.ManagedStatus == "已接管" && !IsRowRunning(row)));
             AddCleanupMenuItem($"批量永久忽略（{selected.Count} 个）", () => BatchSetManagementIntent(ManagementIntent.Ignored), selected.Any(row => !IsRowRunning(row)));
-            AddCleanupMenuItem($"批量完全重置（{selected.Count} 个）", BatchDeleteSelectedRecords, selected.Any(row => !IsRowRunning(row)));
             _cleanupDeleteMenu.Show(anchor, new Point(0, anchor.Height));
             return;
         }
@@ -543,10 +576,11 @@ internal sealed class MainForm : Form
         }
 
         AddCleanupMenuItem("清除缓存", ClearSelectedCache, !isRunning && CanClearCache(row));
-        AddCleanupMenuItem("一键清除接管属性", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false), !isRunning);
-        AddCleanupMenuItem("清除后重新接管", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false), !isRunning);
-        AddCleanupMenuItem("删除插件记录并清除接管属性（推荐）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false), !isRunning);
-        AddCleanupMenuItem("仅删除插件记录", DeleteSelectedRecord, !isRunning && !string.IsNullOrWhiteSpace(row.GameId));
+        AddCleanupMenuItem("恢复最近隔离缓存", RestoreSelectedQuarantine, !isRunning && !string.IsNullOrWhiteSpace(row.GameId));
+        AddCleanupMenuItem("清除 VGC 启动设置（保留记录）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false), !isRunning);
+        AddCleanupMenuItem("清除后重新检测并接管", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false), !isRunning);
+        AddCleanupMenuItem("解除 VGC 接管并删记录（保留缓存）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false), !isRunning);
+        AddCleanupMenuItem("仅删孤立 VGC 记录（高级）", DeleteSelectedRecord, !isRunning && !string.IsNullOrWhiteSpace(row.GameId) && string.IsNullOrWhiteSpace(row.VniteId));
         AddCleanupMenuItem("解除接管", () => SetSelectedManagementIntent(ManagementIntent.Unmanaged), !isRunning && row.ManagedStatus == "已接管" && row.ManagementIntent is not ManagementIntent.Ignored);
         if (row.ManagementIntent == ManagementIntent.Ignored)
         {
@@ -557,7 +591,6 @@ internal sealed class MainForm : Form
             AddCleanupMenuItem("永久忽略", () => SetSelectedManagementIntent(ManagementIntent.Ignored), !isRunning);
         }
 
-        AddCleanupMenuItem("完全重置当前游戏", ResetSelectedGame, !isRunning && !string.IsNullOrWhiteSpace(row.GameId));
         _cleanupDeleteMenu.Items.Add(new ToolStripSeparator());
         AddCleanupMenuItem("从 Vnite 删除（高级危险操作）", ShowDeleteFromVnitePreview, !isRunning);
         _cleanupDeleteMenu.Show(anchor, new Point(0, anchor.Height));
@@ -593,8 +626,8 @@ internal sealed class MainForm : Form
             AddMenuItem("批量扫描接管残留（Dry Run）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: true));
             AddMenuItem("批量清除接管属性", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false));
             AddMenuItem("批量清除后重新接管", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false));
-            AddMenuItem("批量删除插件记录并清除接管属性（推荐）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false));
-            AddMenuItem("批量仅删除插件记录", BatchDeleteSelectedRecords);
+            AddMenuItem("批量解除 VGC 接管并删记录（保留缓存）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false));
+            AddMenuItem("批量仅删孤立 VGC 记录（高级）", BatchDeleteSelectedRecords);
             AddMenuItem("批量解除接管", () => BatchSetManagementIntent(ManagementIntent.Unmanaged));
             return;
         }
@@ -606,6 +639,12 @@ internal sealed class MainForm : Form
             return;
         }
 
+        if (!string.IsNullOrWhiteSpace(row.SourceRoot)) AddMenuItem(
+            string.IsNullOrWhiteSpace(row.ArchivePath) ? "打开游戏根目录" : "定位游戏压缩包", OpenSelectedSourceRoot);
+        if (!string.IsNullOrWhiteSpace(row.CacheRoot)) AddMenuItem("打开游戏缓存目录", OpenSelectedCacheRoot);
+        if (!string.IsNullOrWhiteSpace(row.GameId)) AddMenuItem("重新扫描可翻译状态", RefreshSelectedTranslationStatus);
+        if (!string.IsNullOrWhiteSpace(row.GameId)) AddMenuItem("导出复制诊断", ExportSelectedCopyDiagnostics);
+
         if (row.ManagedStatus != "已接管")
         {
             AddMenuItem("接管", RequestAdoptRepair);
@@ -616,19 +655,16 @@ internal sealed class MainForm : Form
             AddMenuItem("清除接管属性", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false));
             AddMenuItem("清除后重新检测", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false));
             AddMenuItem("永久忽略", () => BatchSetManagementIntent(ManagementIntent.Ignored));
-            if (!string.IsNullOrWhiteSpace(row.SourceRoot)) AddMenuItem("打开源目录", OpenSelectedSourceRoot);
             AddMenuItem("查看诊断", DiagnoseSelectedGame);
-            AddMenuItem("删除插件记录", DeleteSelectedRecord);
+            AddMenuItem("解除 VGC 接管并删记录（保留缓存）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false));
             return;
         }
 
         if (row.ManagementIntent == ManagementIntent.Ignored)
         {
             AddMenuItem("取消忽略", () => SetSelectedManagementIntent(ManagementIntent.Managed));
-            AddMenuItem("打开源目录", OpenSelectedSourceRoot);
             AddMenuItem("查看历史", OpenLatestLaunchDetail);
-            AddMenuItem("删除插件记录", DeleteSelectedRecord);
-            AddMenuItem("完全重置", DeleteSelectedRecord);
+            AddMenuItem("解除 VGC 接管并删记录（保留缓存）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false));
             return;
         }
 
@@ -636,10 +672,8 @@ internal sealed class MainForm : Form
         {
             AddMenuItem("恢复管理", () => SetSelectedManagementIntent(ManagementIntent.Managed));
             AddMenuItem("查看诊断", DiagnoseSelectedGame);
-            AddMenuItem("打开源目录", OpenSelectedSourceRoot);
             AddMenuItem("永久忽略", () => SetSelectedManagementIntent(ManagementIntent.Ignored));
-            AddMenuItem("删除插件记录", DeleteSelectedRecord);
-            AddMenuItem("完全重置", DeleteSelectedRecord);
+            AddMenuItem("解除 VGC 接管并删记录（保留缓存）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false));
             return;
         }
 
@@ -650,26 +684,32 @@ internal sealed class MainForm : Form
             AddMenuItem("验证缓存", DiagnoseSelectedGame);
             AddMenuItem("刷新缓存", PrepareSelectedGameCache);
             AddMenuItem("清除缓存", ClearSelectedCache);
-            AddMenuItem("打开缓存目录", OpenSelectedCacheRoot);
         }
         AddMenuItem("诊断", DiagnoseSelectedGame);
+        AddMenuItem("启动前预检", PreviewSelectedLaunch);
         AddMenuItem("自动修复", RequestAdoptRepair);
         AddMenuItem("手动修复", ManualRepairSelectedGame);
         AddMenuItem("清除接管属性", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: false, dryRun: false));
         AddMenuItem("清除后重新检测", () => RequestClearTakeoverProperties(readopt: true, deletePluginRecord: false, dryRun: false));
         AddMenuItem("修改启动模式", ChangeSelectedLaunchMode);
-        AddMenuItem("打开 MTool/MCenter", OpenMToolCenter);
-        AddMenuItem("打开选中游戏 MTool 模板", OpenSelectedMToolTemplate);
+        var mtoolArtifact = DetectMToolArtifact(row.CacheRoot, ContentSourceRoot(row));
+        if (mtoolArtifact?.Kind is "bat" or "exe")
+        {
+            AddMenuItem("打开 MTool/MCenter", OpenMToolCenter);
+            AddMenuItem("在新版 MTool 中添加游戏…", OpenSelectedGameForMTool);
+            AddMenuItem(mtoolArtifact.Kind == "bat" ? "打开选中游戏 MTool 模板" : "打开选中游戏 MTool EXE", OpenSelectedMToolArtifact);
+        }
         AddMenuItem("修改启动程序", ManualRepairSelectedGame);
         AddMenuItem("解除接管", () => SetSelectedManagementIntent(ManagementIntent.Unmanaged));
         AddMenuItem("暂停接管", () => SetSelectedManagementIntent(ManagementIntent.Suspended));
         AddMenuItem("同步存档", ImportSaveForSelectedGame);
         AddMenuItem("查看最近启动", OpenLatestLaunchDetail);
-        AddMenuItem("删除插件记录", DeleteSelectedRecord);
+        AddMenuItem("解除 VGC 接管并删记录（保留缓存）", () => RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false));
     }
 
     private void LoadStatus()
     {
+        var loadWatch = Stopwatch.StartNew();
         try
         {
             var settingsHealth = VgcSettingsStore.LoadWithDiagnostics();
@@ -679,26 +719,37 @@ internal sealed class MainForm : Form
             var migrations = new MigrationRunner(factory);
             migrations.Initialize();
 
+            var databaseReadStarted = loadWatch.ElapsedMilliseconds;
             var games = new GameRepository(factory).List();
+            var archives = new ArchiveSourceRepository(factory).List()
+                .ToDictionary(source => source.GameId, StringComparer.OrdinalIgnoreCase);
+            var databaseReadMs = loadWatch.ElapsedMilliseconds - databaseReadStarted;
             var installedVersion = ReadInstalledPluginVersion();
             var latestActivity = ReadLatestActivity();
             var copyProgress = ReadLatestCopyProgress();
             var diagnostics = ReadAdoptDiagnostics();
             var residueDiagnostics = ReadTakeoverResidueDiagnostics();
-            var launchStates = ReadLaunchStates();
+            var launchEvidence = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var launchStates = ReadLaunchStates(launchEvidence);
             var totalCacheBytes = games.Sum(game => game.CacheSizeBytes);
             var readyCount = games.Count(game => game.CacheStatus == CacheStatus.Ready);
             var runningCount = games.Count(game => game.CacheStatus == CacheStatus.Running);
             var failedCount = games.Count(game => game.CacheStatus == CacheStatus.Failed);
-            var rows = BuildRows(games, diagnostics, residueDiagnostics, launchStates);
+            var rowBuildStarted = loadWatch.ElapsedMilliseconds;
+            var rows = BuildRows(games, archives, diagnostics, residueDiagnostics, launchStates, launchEvidence);
+            var rowBuildMs = loadWatch.ElapsedMilliseconds - rowBuildStarted;
+            rows = rows.Select(row => row with
+            {
+                TranslationStatus = ArchiveAwaitingExtraction(row) ? "压缩包未解压：能力待检测" : string.IsNullOrWhiteSpace(row.GameId) ||
+                    (string.IsNullOrWhiteSpace(row.CacheRoot) && string.IsNullOrWhiteSpace(row.SourceRoot))
+                    ? "无可扫描目录" : "扫描中"
+            }).ToList();
             if (_onlyIssues.Checked)
             {
                 rows = rows.Where(row => !string.IsNullOrWhiteSpace(row.Issue) || row.ManagedStatus != "已接管").ToList();
             }
 
-            _pluginStatus.Text = installedVersion is null
-                ? "未发现已安装插件"
-                : $"已安装 {installedVersion}；维护模式 {(IsMaintenanceModeEnabled() ? "已开启" : "关闭")}；如果 Vnite 已启动，插件会在启动时自动激活";
+            _pluginStatus.Text = DescribePluginInstallation(_projectRoot, installedVersion);
             _databaseStatus.Text = $"{databaseOptions.DatabasePath}；游戏 {games.Count} 个；Schema {Schema.CurrentVersion}";
             _cacheStatus.Text = $"Ready {readyCount}，Running {runningCount}，Failed {failedCount}，缓存占用 {ToMb(totalCacheBytes):N0} MB";
             _recentStatus.Text = latestActivity;
@@ -712,8 +763,13 @@ internal sealed class MainForm : Form
             _taskCard.Text = $"后台任务\n{runningCount:N0} 个运行";
             _failedCard.Text = $"启动失败\n{rows.Count(row => row.LaunchStatus.Contains("失败", StringComparison.OrdinalIgnoreCase) || row.CacheStatus == "失败"):N0} 个";
             _skippedCard.Text = $"跳过/残留\n{(diagnostics?.Skipped.Count ?? 0) + (residueDiagnostics?.Residues.Count ?? 0):N0} 个";
+            _translationScanTimes.Clear();
+            _manualTranslationScans.Clear();
             _allRows = rows;
             ApplyGameFilters();
+            _databaseStatus.Text += $"；初始加载 {loadWatch.ElapsedMilliseconds} ms（数据库 {databaseReadMs}，游戏列表 {rowBuildMs}）";
+            _databaseStatus.Text += "；翻译扫描中";
+            StartTranslationStatusScan(rows);
         }
         catch (Exception error)
         {
@@ -728,10 +784,95 @@ internal sealed class MainForm : Form
             _recentStatus.Text = "请先确认插件已安装，并至少启动过一次 Vnite";
             _adoptStatus.Text = "未知";
             _copyProgressStatus.Text = "未知";
+            _translationScanTimes.Clear();
+            _manualTranslationScans.Clear();
             _allRows = [];
             _gamesGrid.DataSource = Array.Empty<GameRow>();
             UpdateDetailsPanel();
         }
+    }
+
+    private void StartTranslationStatusScan(IReadOnlyList<GameRow> rows)
+    {
+        var version = Interlocked.Increment(ref _translationScanVersion);
+        var scanStartedUtc = DateTimeOffset.UtcNow;
+        var scanWatch = Stopwatch.StartNew();
+        _ = Task.Run(() =>
+        {
+            var capabilities = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Exception? scanError = null;
+            try
+            {
+                Parallel.ForEach(rows, new ParallelOptions { MaxDegreeOfParallelism = 4 }, row =>
+                {
+                    if (version != Volatile.Read(ref _translationScanVersion)) return;
+                    if (ArchiveAwaitingExtraction(row) || string.IsNullOrWhiteSpace(row.GameId) ||
+                        (string.IsNullOrWhiteSpace(row.CacheRoot) && string.IsNullOrWhiteSpace(row.SourceRoot))) return;
+                    capabilities[row.GameId] = $"MTool：{DescribeMToolCapability(row.CacheRoot, ContentSourceRoot(row))}；翻译：{DescribeTranslationCapability(ContentSourceRoot(row), row.CacheRoot, row.ExecutablePath)}";
+                });
+            }
+            catch (Exception error)
+            {
+                scanError = error;
+            }
+
+            if (version != Volatile.Read(ref _translationScanVersion) || IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(() =>
+            {
+                if (version != _translationScanVersion || IsDisposed) return;
+                var scannedUtc = DateTimeOffset.UtcNow;
+                _allRows = _allRows.Select(row =>
+                {
+                    if (_manualTranslationScans.Contains(row.GameId) ||
+                        (_translationScanTimes.TryGetValue(row.GameId, out var manualUtc) && manualUtc > scanStartedUtc)) return row;
+                    if (capabilities.TryGetValue(row.GameId, out var capability))
+                    {
+                        _translationScanTimes[row.GameId] = scannedUtc;
+                        return row with { TranslationStatus = capability };
+                    }
+                    return row.TranslationStatus == "扫描中" ? row with { TranslationStatus = "扫描失败" } : row;
+                }).ToList();
+                ApplyGameFilters();
+                _databaseStatus.Text = _databaseStatus.Text.Replace("翻译扫描中",
+                    scanError is null ? $"翻译扫描完成 {scanWatch.ElapsedMilliseconds} ms" : "翻译扫描失败");
+            });
+        });
+    }
+
+    private void RefreshSelectedTranslationStatus()
+    {
+        if (GetSelectedRow() is not { } row || string.IsNullOrWhiteSpace(row.GameId)) return;
+        if (ArchiveAwaitingExtraction(row))
+        {
+            MessageBox.Show(this, "压缩包尚未解压。首次缓存完成后再扫描 MTool 和翻译程序。", "可翻译状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (!_manualTranslationScans.Add(row.GameId)) return;
+        var version = Volatile.Read(ref _translationScanVersion);
+        _translationScanTimes.Remove(row.GameId);
+        _allRows = _allRows.Select(item => item.GameId == row.GameId ? item with { TranslationStatus = "扫描中" } : item).ToList();
+        ApplyGameFilters();
+        _ = Task.Run(() =>
+        {
+            string status;
+            try
+            {
+                status = $"MTool：{DescribeMToolCapability(row.CacheRoot, ContentSourceRoot(row))}；翻译：{DescribeTranslationCapability(ContentSourceRoot(row), row.CacheRoot, row.ExecutablePath)}";
+            }
+            catch
+            {
+                status = "扫描失败";
+            }
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(() =>
+            {
+                if (IsDisposed || version != _translationScanVersion) return;
+                _manualTranslationScans.Remove(row.GameId);
+                if (status != "扫描失败") _translationScanTimes[row.GameId] = DateTimeOffset.UtcNow;
+                _allRows = _allRows.Select(item => item.GameId == row.GameId ? item with { TranslationStatus = status } : item).ToList();
+                ApplyGameFilters();
+            });
+        });
     }
 
     private void ApplyGameFilters()
@@ -773,7 +914,7 @@ internal sealed class MainForm : Form
         "已缓存" => rows.Where(row => row.CacheStatus == "已缓存"),
         "启动失败" => rows.Where(row => row.LaunchStatus.Contains("失败", StringComparison.OrdinalIgnoreCase) || row.CacheStatus == "失败"),
         "目录失效" => rows.Where(row => row.Issue.Contains("目录", StringComparison.CurrentCultureIgnoreCase) || row.Issue.Contains("不存在", StringComparison.CurrentCultureIgnoreCase)),
-        "重复记录" => rows.GroupBy(row => Normalize(row.SourceRoot), StringComparer.OrdinalIgnoreCase).Where(group => !string.IsNullOrWhiteSpace(group.Key) && group.Count() > 1).SelectMany(group => group),
+        "重复记录" => rows.GroupBy(row => Normalize(string.IsNullOrWhiteSpace(row.ArchivePath) ? row.SourceRoot : row.ArchivePath), StringComparer.OrdinalIgnoreCase).Where(group => !string.IsNullOrWhiteSpace(group.Key) && group.Count() > 1).SelectMany(group => group),
         "已忽略" => rows.Where(row => row.ManagementIntent == ManagementIntent.Ignored),
         "已暂停" => rows.Where(row => row.ManagementIntent == ManagementIntent.Suspended),
         "最近游玩" => rows.Where(row => !string.IsNullOrWhiteSpace(row.LastPlayed)).OrderByDescending(row => row.LastPlayed),
@@ -829,9 +970,11 @@ internal sealed class MainForm : Form
 
     private static List<GameRow> BuildRows(
         IReadOnlyCollection<GameRecord> games,
+        IReadOnlyDictionary<string, ArchiveSourceRecord> archives,
         AdoptDiagnostics? diagnostics,
         TakeoverResidueDiagnostics? residueDiagnostics,
-        IReadOnlyDictionary<string, string> launchStates)
+        IReadOnlyDictionary<string, string> launchStates,
+        IReadOnlyDictionary<string, string> launchEvidence)
     {
         var sourceRoots = new HashSet<string>(games.Select(game => Normalize(game.SourceRoot)), StringComparer.OrdinalIgnoreCase);
         var knownGameIds = new HashSet<string>(games.Select(game => game.GameId), StringComparer.OrdinalIgnoreCase);
@@ -848,18 +991,32 @@ internal sealed class MainForm : Form
             .GroupBy(item => Normalize(item.SourceRoot), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase)
             ?? new Dictionary<string, SkippedAdoptItem>(StringComparer.OrdinalIgnoreCase);
+        var launcherRoot = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "launchers");
+        var launcherPaths = Directory.Exists(launcherRoot)
+            ? Directory.EnumerateFiles(launcherRoot, "*.lnk").ToArray()
+            : [];
 
-        var rows = games
+        var rows = games.AsParallel().AsOrdered().WithDegreeOfParallelism(4)
             .Select(game =>
             {
-                var managedIssue = DescribeManagedIssue(game);
-                var diagnostic = skippedByGameId.GetValueOrDefault(game.GameId)
+                archives.TryGetValue(game.GameId, out var archive);
+                var sourceExists = archive is null
+                    ? !string.IsNullOrWhiteSpace(game.SourceRoot) && Directory.Exists(game.SourceRoot)
+                    : File.Exists(archive.ArchivePath);
+                var executableExists = archive is not null ||
+                    !string.IsNullOrWhiteSpace(game.ExecutablePath) && File.Exists(game.ExecutablePath);
+                var managedIssue = archive is not null && !sourceExists
+                    ? "游戏压缩包不存在或不可访问"
+                    : DescribeManagedIssue(game, sourceExists, executableExists);
+                var diagnostic = archive is not null ? null :
+                    (skippedByGameId.GetValueOrDefault(game.GameId)
                     ?? (!string.IsNullOrWhiteSpace(game.VniteGameId) ? skippedByGameId.GetValueOrDefault(game.VniteGameId) : null)
-                    ?? skippedBySourceRoot.GetValueOrDefault(Normalize(game.SourceRoot));
+                    ?? skippedBySourceRoot.GetValueOrDefault(Normalize(game.SourceRoot)));
                 var diagnosticIssue = diagnostic is null ? "" : TranslateSkipReason(diagnostic.Reason, diagnostic.Candidates.Count);
                 var issue = string.IsNullOrWhiteSpace(diagnosticIssue) ? managedIssue : diagnosticIssue;
-                var hasLaunchSource = HasUsableLaunchSource(game);
-                var launcherShortcutPath = FindLauncherShortcutPath(game.GameId);
+                var hasLaunchSource = sourceExists && executableExists;
+                var launcherShortcutPath = string.IsNullOrWhiteSpace(game.GameId) ? "" :
+                    launcherPaths.FirstOrDefault(path => Path.GetFileName(path).Contains(game.GameId, StringComparison.OrdinalIgnoreCase)) ?? "";
                 var hasVerifiedVgcLauncher = !string.IsNullOrWhiteSpace(launcherShortcutPath) && File.Exists(launcherShortcutPath);
                 if (hasLaunchSource && diagnostic is null && !hasVerifiedVgcLauncher)
                 {
@@ -871,18 +1028,18 @@ internal sealed class MainForm : Form
                     ? (string.IsNullOrWhiteSpace(issue) ? "正常" : "需处理")
                     : "待接管";
                 var candidatePrograms = diagnostic is null
-                    ? FindCandidatePrograms(game.SourceRoot, game.DisplayName)
+                    ? (!hasLaunchSource ? FindCandidatePrograms(game.SourceRoot, game.DisplayName) : "")
                     : string.Join("; ", diagnostic.Candidates.Take(5));
 
                 return new GameRow(
-                    ResolveStatusIcon(game, launchStates.TryGetValue(game.GameId, out var launchStateForIcon) ? launchStateForIcon : ""),
+                    ResolveStatusIcon(game, launchStates.TryGetValue(game.GameId, out var launchStateForIcon) ? launchStateForIcon : "", managedIssue),
                     game.DisplayName,
                     game.GameId,
                     game.VniteGameId ?? "",
                     game.ManagementIntent,
                     managedStatus,
                     adoptStatus,
-                    TranslateCacheStatus(game.CacheStatus),
+                    archive is null ? TranslateCacheStatus(game.CacheStatus) : DescribeArchiveCacheStatus(game),
                     launchStates.TryGetValue(game.GameId, out var launchState) ? launchState : "",
                     issue,
                     TranslateLaunchModeOverride(game.LaunchModeOverride),
@@ -892,7 +1049,10 @@ internal sealed class MainForm : Form
                     game.CacheRoot,
                     game.ExecutablePath,
                     launcherShortcutPath,
-                    candidatePrograms);
+                    candidatePrograms,
+                    "检测中",
+                    launchEvidence.GetValueOrDefault(game.GameId, archive is null ? "暂无真实启动记录" : "已导入，尚无真实启动记录"),
+                    archive?.ArchivePath ?? "");
             })
             .ToList();
 
@@ -954,24 +1114,24 @@ internal sealed class MainForm : Form
             .ToList();
     }
 
-    private static string ResolveStatusIcon(GameRecord game, string launchState)
+    private static string ResolveStatusIcon(GameRecord game, string launchState, string managedIssue)
     {
         if (game.ManagementIntent == ManagementIntent.Ignored) return "⊘";
         if (game.ManagementIntent == ManagementIntent.Suspended) return "⏸";
         if (game.CacheStatus == CacheStatus.Running) return "▶";
         if (game.CacheStatus == CacheStatus.Ready) return "✓";
         if (game.CacheStatus == CacheStatus.Failed || launchState.Contains("failed", StringComparison.OrdinalIgnoreCase)) return "!";
-        if (!string.IsNullOrWhiteSpace(DescribeManagedIssue(game))) return "⚠";
+        if (!string.IsNullOrWhiteSpace(managedIssue)) return "⚠";
         return "·";
     }
 
-    private static string DescribeManagedIssue(GameRecord game)
+    private static string DescribeManagedIssue(GameRecord game, bool sourceExists, bool executableExists)
     {
         if (game.CacheStatus == CacheStatus.Failed) return "缓存失败，查看最近日志";
         if (string.IsNullOrWhiteSpace(game.SourceRoot)) return "缺少游戏本体目录";
-        if (!Directory.Exists(game.SourceRoot)) return "游戏本体目录不存在或不可访问";
+        if (!sourceExists) return "游戏本体目录不存在或不可访问";
         if (string.IsNullOrWhiteSpace(game.ExecutablePath)) return "缺少真实启动程序";
-        if (!File.Exists(game.ExecutablePath)) return "真实启动程序不存在或不可访问";
+        if (!executableExists) return "真实启动程序不存在或不可访问";
         if (string.IsNullOrWhiteSpace(game.CacheRoot)) return "缺少缓存目录";
         return "";
     }
@@ -982,12 +1142,6 @@ internal sealed class MainForm : Form
         if (string.IsNullOrWhiteSpace(existing)) return issue;
         return existing.Contains(issue, StringComparison.OrdinalIgnoreCase) ? existing : $"{existing}；{issue}";
     }
-
-    private static bool HasUsableLaunchSource(GameRecord game) =>
-        !string.IsNullOrWhiteSpace(game.SourceRoot) &&
-        Directory.Exists(game.SourceRoot) &&
-        !string.IsNullOrWhiteSpace(game.ExecutablePath) &&
-        File.Exists(game.ExecutablePath);
 
     private static string TranslateCacheStatus(CacheStatus status) => status switch
     {
@@ -1005,6 +1159,14 @@ internal sealed class MainForm : Form
         CacheStatus.Failed => "失败",
         _ => status.ToString()
     };
+
+    private static string DescribeArchiveCacheStatus(GameRecord game)
+    {
+        if (game.CacheStatus is CacheStatus.Checking or CacheStatus.Copying or CacheStatus.Verifying) return "正在准备";
+        if (game.CacheStatus == CacheStatus.Running) return "运行中";
+        if (game.CacheStatus == CacheStatus.Failed) return "失败";
+        return File.Exists(Path.Combine(game.CacheRoot, ".vgc-archive-ready.json")) ? "缓存就绪" : "已导入，等待解压";
+    }
 
     private static string TranslateLaunchModeOverride(GameLaunchModeOverride mode) => mode switch
     {
@@ -1134,6 +1296,243 @@ internal sealed class MainForm : Form
         }
 
         OpenFolder(row.CacheRoot);
+    }
+
+    private async Task RequestArchiveImportAsync()
+    {
+        if (HasPendingCommand("archive-import"))
+        {
+            MessageBox.Show(this, "上一次压缩包导入仍在等待或处理中，请查看“导入结果”。", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        using var picker = new OpenFileDialog
+        {
+            Title = "选择 NAS 游戏压缩包",
+            Filter = "游戏压缩包|*.zip;*.7z;*.rar|所有文件|*.*",
+            CheckFileExists = true
+        };
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+
+        var settings = VgcSettingsStore.LoadRequired();
+        if (string.IsNullOrWhiteSpace(settings.DefaultCacheRoot))
+        {
+            MessageBox.Show(this, "请先设置默认 SSD 缓存根目录。", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var sevenZip = Environment.GetEnvironmentVariable("VGC_7ZIP_PATH") ?? @"C:\Program Files\7-Zip\7z.exe";
+        ArchivePreviewResult preview;
+        try { preview = await ArchivePreview.ReadAsync(picker.FileName, sevenZip); }
+        catch (Exception error)
+        {
+            MessageBox.Show(this, $"读取压缩包失败：{error.Message}", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (!preview.Supported || preview.ExecutableCandidates.Count == 0)
+        {
+            MessageBox.Show(this, $"暂不能导入：{string.Join("；", preview.Warnings)}", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var importFactory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+        var existingArchive = new ArchiveSourceRepository(importFactory).List()
+            .FirstOrDefault(item => item.ArchivePath.Equals(picker.FileName, StringComparison.OrdinalIgnoreCase));
+        var existingGame = existingArchive is null ? null : new GameRepository(importFactory).GetById(existingArchive.GameId);
+
+        using var form = new Form
+        {
+            Text = "确认压缩包游戏",
+            Width = 660,
+            Height = 310,
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false
+        };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(12) };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var oldSummary = existingArchive is null ? "" :
+            $"\n原记录：{existingArchive.FileCount} 个文件，约 {existingArchive.ExpandedBytes / 1024d / 1024d / 1024d:N2} GB；主程序 {existingArchive.ExecutableRelativePath}";
+        layout.Controls.Add(new Label { Text = $"{picker.FileName}\n当前：{preview.FileCount} 个文件，解压约 {preview.ExpandedBytes / 1024d / 1024d / 1024d:N2} GB{oldSummary}", AutoSize = true }, 0, 0);
+        var name = new TextBox { Dock = DockStyle.Top, Text = existingGame?.DisplayName ?? Path.GetFileNameWithoutExtension(picker.FileName), ReadOnly = existingGame is not null };
+        layout.Controls.Add(new Label { Text = "游戏名称（压缩包名仅作建议，请核对 Vnite 中要显示的名称）", AutoSize = true }, 0, 1);
+        layout.Controls.Add(name, 0, 2);
+        var executable = new ComboBox { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
+        executable.Items.AddRange(preview.ExecutableCandidates.Cast<object>().ToArray());
+        executable.SelectedIndex = -1;
+        layout.Controls.Add(new Label { Text = "请手动选择游戏主程序（核对完整包内路径）", AutoSize = true }, 0, 3);
+        layout.Controls.Add(executable, 0, 4);
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Top, FlowDirection = FlowDirection.RightToLeft };
+        buttons.Controls.Add(new Button { Text = "取消", DialogResult = DialogResult.Cancel, AutoSize = true });
+        var confirm = new Button { Text = "确认导入", DialogResult = DialogResult.OK, AutoSize = true, Enabled = false };
+        executable.SelectedIndexChanged += (_, _) => confirm.Enabled = executable.SelectedIndex >= 0;
+        buttons.Controls.Add(confirm);
+        layout.Controls.Add(buttons, 0, 5);
+        form.Controls.Add(layout);
+        if (form.ShowDialog(this) != DialogResult.OK) return;
+        if (string.IsNullOrWhiteSpace(name.Text))
+        {
+            MessageBox.Show(this, "游戏名称不能为空。", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (existingArchive is not null && existingGame is not null)
+        {
+            var archiveInfo = new FileInfo(picker.FileName);
+            var changed = existingArchive.ArchiveSizeBytes != archiveInfo.Length ||
+                existingArchive.ArchiveLastWriteUtc.UtcDateTime != archiveInfo.LastWriteTimeUtc ||
+                existingArchive.FileCount != preview.FileCount || existingArchive.ExpandedBytes != preview.ExpandedBytes ||
+                !existingArchive.ExecutableRelativePath.Equals(executable.SelectedItem!.ToString(), StringComparison.OrdinalIgnoreCase);
+            if (changed && Directory.Exists(existingGame.CacheRoot) && Directory.EnumerateFileSystemEntries(existingGame.CacheRoot).Any())
+            {
+                MessageBox.Show(this, "源压缩包或主程序已变化，但旧缓存非空。请先备份存档，再对这一款游戏执行安全清理/隔离，确认后重新导入。旧缓存不会自动覆盖。",
+                    "压缩包更新需处理旧缓存", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+        }
+        var existingNames = new GameRepository(importFactory).List();
+        if (existingGame is null && existingNames.Any(game => game.DisplayName.Equals(name.Text.Trim(), StringComparison.OrdinalIgnoreCase)) &&
+            MessageBox.Show(this, "已有同名游戏。请确认这不是重复导入或错误关联。仍要继续吗？", "核对游戏名称",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
+        Directory.CreateDirectory(_commandsRoot);
+        var requestPath = Path.Combine(_commandsRoot, "archive-import-request.json");
+        if (HasPendingCommand("archive-import"))
+        {
+            MessageBox.Show(this, "已有一个压缩包导入请求正在等待 Vnite 插件处理。", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        var requestId = Guid.NewGuid().ToString("N");
+        var requestedUtc = DateTimeOffset.UtcNow.ToString("O");
+        WriteAllTextAtomic(Path.Combine(_commandsRoot, "archive-import-result.json"),
+            JsonSerializer.Serialize(new { status = "pending", request_id = requestId, requested_utc = requestedUtc }));
+        WriteAllTextAtomic(requestPath, JsonSerializer.Serialize(new
+        {
+            request_id = requestId,
+            archive_path = picker.FileName,
+            executable_relative_path = executable.SelectedItem!.ToString(),
+            display_name = name.Text.Trim(),
+            cache_root = settings.DefaultCacheRoot,
+            requested_utc = requestedUtc
+        }));
+        _archiveImportPending = true;
+        MessageBox.Show(this, "已提交单游戏导入请求。处理完成后列表会自动刷新；可点“导入结果”查看进度。", "导入压缩包", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private bool HasPendingCommand(string name)
+    {
+        if (File.Exists(Path.Combine(_commandsRoot, $"{name}-request.json"))) return true;
+        var resultPath = Path.Combine(_commandsRoot, $"{name}-result.json");
+        if (!File.Exists(resultPath)) return false;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(resultPath));
+            if (GetString(document.RootElement, "status") != "pending") return false;
+            var writtenUtc = File.GetLastWriteTimeUtc(resultPath);
+            return DateTime.UtcNow - writtenUtc < TimeSpan.FromMinutes(15);
+        }
+        catch (Exception error) when (error is IOException or JsonException)
+        {
+            return true;
+        }
+    }
+
+    private bool IsArchiveImportPending() => ReadArchiveImportStatus() == "pending";
+
+    private bool IsArchiveImportComplete() => ReadArchiveImportStatus() is { } status && status != "pending";
+
+    private string? ReadArchiveImportStatus()
+    {
+        var resultPath = Path.Combine(_commandsRoot, "archive-import-result.json");
+        if (!File.Exists(resultPath)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(resultPath));
+            var status = GetString(document.RootElement, "status") ?? "complete";
+            if (status == "pending" && !HasPendingCommand("archive-import")) return "timeout";
+            return status;
+        }
+        catch (Exception error) when (error is IOException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    private void ShowArchiveImportResult()
+    {
+        var resultPath = Path.Combine(_commandsRoot, "archive-import-result.json");
+        if (!File.Exists(resultPath))
+        {
+            MessageBox.Show(this, "暂无结果；如果刚提交请求，请稍后再查看。", "压缩包导入结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(resultPath));
+            var root = document.RootElement;
+            if (ReadArchiveImportStatus() == "timeout")
+            {
+                MessageBox.Show(this, "上次导入没有收到完成回执，请检查 Vnite 是否运行及插件日志；不要把超时当作导入成功。", "压缩包导入结果", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (GetString(root, "status") == "pending")
+            {
+                MessageBox.Show(this, "请求正在等待 Vnite 插件处理。", "压缩包导入结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var exitCode = GetInt(root, "exit_code");
+            var error = GetString(root, "error") ??
+                (root.TryGetProperty("result", out var agentResult) ? GetString(agentResult, "error") : null) ??
+                GetString(root, "stderr") ?? "";
+            var applied = root.TryGetProperty("vnite_result", out var vnite) ? GetInt(vnite, "applied_count") : 0;
+            var text = string.IsNullOrWhiteSpace(error) && exitCode == 0 && applied > 0
+                ? $"已写入 VGC 和 Vnite 游戏库：{applied} 个。请在 Vnite 中查看并启动。"
+                : $"导入尚未完成。Agent 返回码：{exitCode}；Vnite 写入数：{applied}。\n{error}";
+            MessageBox.Show(this, text, "压缩包导入结果", MessageBoxButtons.OK,
+                applied > 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            if (applied > 0) LoadStatus();
+        }
+        catch (Exception error) when (error is IOException or JsonException)
+        {
+            MessageBox.Show(this, $"读取结果失败：{error.Message}", "压缩包导入结果", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void ShowArchiveDiscoveryResult()
+    {
+        var resultPath = Path.Combine(_commandsRoot, "archive-discovery-result.json");
+        if (!File.Exists(resultPath))
+        {
+            MessageBox.Show(this, "尚无自动发现结果。请在 Vnite 插件设置中开启自动发现，并设置 NAS 游戏库根目录。", "压缩包自动发现", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(resultPath));
+            var root = document.RootElement;
+            var lines = new List<string> { $"扫描目录：{GetString(root, "root")}", $"时间：{GetString(root, "timestamp_utc")}" };
+            if (root.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in results.EnumerateArray().Take(20))
+                {
+                    var status = GetString(item, "status") switch
+                    {
+                        "imported" => "已自动导入",
+                        "needs_confirmation" => "需手动确认主程序",
+                        "source_changed_needs_review" => "源包已变化，需单游戏复核",
+                        _ => "处理失败"
+                    };
+                    lines.Add($"{status}：{GetString(item, "archive_path")}");
+                }
+            }
+            MessageBox.Show(this, string.Join(Environment.NewLine, lines), "压缩包自动发现", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception error) when (error is IOException or JsonException)
+        {
+            MessageBox.Show(this, $"读取自动发现结果失败：{error.Message}", "压缩包自动发现", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private void ImportSaveForSelectedGame()
@@ -1293,7 +1692,8 @@ internal sealed class MainForm : Form
             return;
         }
 
-        OpenFolder(row.SourceRoot);
+        if (string.IsNullOrWhiteSpace(row.ArchivePath)) OpenFolder(row.SourceRoot);
+        else OpenFileLocation(row.ArchivePath);
     }
 
     private GameRow? GetSelectedRow()
@@ -1348,24 +1748,101 @@ internal sealed class MainForm : Form
             $"接管状态：{row.AdoptStatus}\r\n" +
             $"管理意图：{TranslateManagementIntent(row.ManagementIntent)}\r\n" +
             $"缓存状态：{row.CacheStatus}\r\n" +
+            (string.IsNullOrWhiteSpace(row.ArchivePath) ? "" : DescribeArchiveSourceSummary(row) + "\r\n") +
+            (string.IsNullOrWhiteSpace(row.ArchivePath) ? "" : $"压缩包准备耗时：{DescribeArchivePreparation(row.CacheRoot)}\r\n") +
             $"启动模式：{row.LaunchMode}\r\n" +
             $"启动状态：{row.LaunchStatus}\r\n" +
+            $"最近启动证据：{row.LaunchEvidence}\r\n" +
+            $"运行锁：{DescribeRuntimeLock(row.GameId)}\r\n" +
+            "说明：运行锁和最近日志只是线索，不能单独证明游戏进程已退出。\r\n" +
             $"问题：{(string.IsNullOrWhiteSpace(row.Issue) ? "无" : row.Issue)}\r\n" +
             $"最近游玩：{row.LastPlayed}\r\n" +
-            $"缓存大小：{row.CacheMb:N0} MB\r\n" +
+            DescribeGameSpaceUsage(row) + "\r\n" +
             "\r\n身份\r\n" +
             $"Game ID：{row.GameId}\r\n" +
             $"Vnite ID：{row.VniteId}\r\n" +
             "\r\n路径\r\n" +
+            $"游戏源：{(string.IsNullOrWhiteSpace(row.ArchivePath) ? "目录" : "压缩包")}\r\n" +
             $"游戏根目录：{row.SourceRoot}\r\n" +
+            (string.IsNullOrWhiteSpace(row.ArchivePath) ? "" : $"压缩包：{row.ArchivePath}\r\n") +
             $"缓存目录：{row.CacheRoot}\r\n" +
             $"启动程序：{row.ExecutablePath}\r\n" +
             $"启动快捷方式：{row.ShortcutPath}\r\n" +
             $"候选启动程序：{row.CandidatePrograms}\r\n" +
+            $"可翻译状态：{row.TranslationStatus}\r\n" +
+            $"状态扫描时间：{(_translationScanTimes.TryGetValue(row.GameId, out var scannedUtc) ? scannedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "未完成")}\r\n" +
+            "提示：游戏目录变化后，此结果可能过期；右键可仅重新扫描这个游戏。\r\n" +
             "\r\nMTool\r\n" +
             BuildMToolDetail(row) +
             "\r\n\r\n建议操作\r\n" +
             string.Join("\r\n", recommended.Select(item => $"- {item}"));
+    }
+
+    private async Task MeasureSelectedGameSizeAsync()
+    {
+        if (_sizeScanCancellation is not null)
+        {
+            _sizeScanCancellation.Cancel();
+            return;
+        }
+        if (GetSelectedRow() is not { } row || string.IsNullOrWhiteSpace(row.GameId))
+        {
+            MessageBox.Show(this, "请先选择一个 VGC 游戏。", "核算实际占用", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var cancellation = new CancellationTokenSource();
+        _sizeScanCancellation = cancellation;
+        _detailsText.AppendText("\r\n正在核算选中游戏的缓存与隔离目录；再次点击“核算实际占用”可取消。\r\n");
+        try
+        {
+            var factory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+            var quarantinePaths = ActiveQuarantineForGame(factory, row.GameId)
+                .Select(entry => entry.QuarantinePath).ToArray();
+            var result = await Task.Run(() =>
+            {
+                var cache = DirectorySizeProbe.Measure(row.CacheRoot, cancellation.Token);
+                long quarantineBytes = 0;
+                long quarantineFiles = 0;
+                foreach (var path in quarantinePaths)
+                {
+                    var item = DirectorySizeProbe.Measure(path, cancellation.Token);
+                    quarantineBytes = checked(quarantineBytes + item.Bytes);
+                    quarantineFiles = checked(quarantineFiles + item.Files);
+                }
+                return (Cache: cache, QuarantineBytes: quarantineBytes, QuarantineFiles: quarantineFiles);
+            }, cancellation.Token);
+            if (IsDisposed) return;
+            MessageBox.Show(this,
+                $"游戏：{row.Name}\n\n缓存目录：{row.CacheRoot}\n实际文件大小：{result.Cache.Bytes / 1024d / 1024d:N1} MB（{result.Cache.Files:N0} 个文件）\n数据库记录：{row.CacheMb:N0} MB\n\n活动隔离缓存：{result.QuarantineBytes / 1024d / 1024d:N1} MB（{result.QuarantineFiles:N0} 个文件，{quarantinePaths.Length} 份）\n\n只统计普通文件，不进入目录链接；未修改游戏或数据库。",
+                "实际占用核算", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!IsDisposed) MessageBox.Show(this, "已取消核算；未修改任何文件。", "核算实际占用", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception error)
+        {
+            if (!IsDisposed) MessageBox.Show(this, $"核算未完成，不能将部分结果当作实际占用：{error.Message}", "核算实际占用", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _sizeScanCancellation = null;
+            cancellation.Dispose();
+        }
+    }
+
+    private static string DescribeRuntimeLock(string gameId)
+    {
+        if (string.IsNullOrWhiteSpace(gameId)) return "无 Game ID";
+        try
+        {
+            return RuntimeGameLock.IsHeld(gameId) ? "存在" : "未发现";
+        }
+        catch
+        {
+            return "无法读取";
+        }
     }
 
     private static string TranslateManagementIntent(ManagementIntent intent) => intent switch
@@ -1380,18 +1857,24 @@ internal sealed class MainForm : Form
     private static List<string> BuildRecommendedActions(GameRow row)
     {
         var actions = new List<string>();
+        if (row.Issue == "游戏压缩包不存在或不可访问")
+        {
+            actions.Add($"原压缩包不可访问：{row.SourceRoot}。请先检查磁盘连接并恢复原路径；若包已移动，确认现有缓存和存档后解除接管，再从新路径导入。");
+            actions.Add("已有缓存可能仍能启动，但清除缓存后无法从原路径重新准备游戏。");
+            return actions;
+        }
         if (row.ManagedStatus != "已接管") actions.Add("点击“自动修复”接管；若候选不明确，右键“手动修复”。");
         if (string.IsNullOrWhiteSpace(row.ExecutablePath) && !string.IsNullOrWhiteSpace(row.CandidatePrograms)) actions.Add("双击“问题”或右键“手动修复”，人工选择启动程序。");
         if (!string.IsNullOrWhiteSpace(row.Issue)) actions.Add("先处理“问题”列，再启动。");
         if (row.CacheStatus is "" or "未缓存") actions.Add("点击“立即缓存”，确认缓存链路。");
         if (!string.IsNullOrWhiteSpace(row.CacheRoot)) actions.Add("右键可打开缓存目录或清除缓存。");
-        if (FindMToolTemplatePath(row.CacheRoot, row.SourceRoot) is not null && row.LaunchMode != "MTool") actions.Add("检测到 MTool 模板；可右键“修改启动模式”设为 MTool 批处理优先。");
+        if (DetectMToolArtifact(row.CacheRoot, ContentSourceRoot(row))?.Kind == "bat" && row.LaunchMode != "MTool") actions.Add("检测到可解析的 MTool 模板；可右键“修改启动模式”设为 MTool 启动优先。");
         if (actions.Count == 0) actions.Add("状态正常，可从 Vnite 或控制台启动。");
         return actions;
     }
 
     private static string BuildCompactRowTooltip(GameRow row) =>
-        $"Game ID: {row.GameId}\nVnite ID: {row.VniteId}\nSource: {row.SourceRoot}\nCache: {row.CacheRoot}\nExe: {row.ExecutablePath}";
+        $"Game ID: {row.GameId}\nVnite ID: {row.VniteId}\nSource: {row.SourceRoot}\nCache: {row.CacheRoot}\nExe: {row.ExecutablePath}\n可翻译状态: {row.TranslationStatus}";
 
     private void HandleGridKeyDown(object? sender, KeyEventArgs e)
     {
@@ -1432,14 +1915,14 @@ internal sealed class MainForm : Form
             this,
             $"你按下了 Delete。\n\n当前游戏：{row.Name}\n\n" +
             "是：清除本地缓存（不删 VGC 记录）\n" +
-            "否：临时删除 VGC 接管记录（可重新接管，不设置永久忽略，不删缓存、不删 Vnite 条目、不删源游戏）\n" +
+            "否：解除 VGC 接管并删除记录（不删缓存、存档、Vnite 条目或源游戏；有 Save Profile 时会阻止）\n" +
             "取消：不操作\n\n" +
             "注意：永久忽略是单独操作，不等于删除记录。",
             "选择删除动作",
             MessageBoxButtons.YesNoCancel,
             MessageBoxIcon.Warning);
         if (choice == DialogResult.Yes) ClearSelectedCache();
-        else if (choice == DialogResult.No) DeleteSelectedRecord();
+        else if (choice == DialogResult.No) RequestClearTakeoverProperties(readopt: false, deletePluginRecord: true, dryRun: false);
     }
 
     private void HandleGridCellDoubleClick(DataGridViewCellEventArgs e)
@@ -1500,6 +1983,56 @@ internal sealed class MainForm : Form
         }
 
         OpenHealthCheckReport();
+    }
+
+    private async void ExportSelectedCopyDiagnostics()
+    {
+        if (GetSelectedRow() is not { } row || string.IsNullOrWhiteSpace(row.GameId))
+        {
+            MessageBox.Show(this, "请先选择一个有数据库记录的游戏。", "导出复制诊断", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new SaveFileDialog
+        {
+            Filter = "ZIP 文件 (*.zip)|*.zip",
+            FileName = $"vgc-cache-{row.GameId}-{DateTime.UtcNow:yyyyMMddHHmmss}.zip"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+        try
+        {
+            var outputPath = dialog.FileName;
+            var snapshot = new CopyDiagnosticSnapshot(row.Name, row.GameId, row.VniteId, row.SourceRoot,
+                row.CacheRoot, row.ExecutablePath, row.CacheStatus, row.LaunchStatus, row.Issue);
+            await Task.Run(() => CopyDiagnosticArchive.Export(outputPath, _logRoot, snapshot));
+            MessageBox.Show(this, $"已导出：{outputPath}\n\n压缩包包含本机路径和原始日志，分享前请检查隐私信息。", "导出复制诊断", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(this, $"导出失败：{error.Message}", "导出复制诊断", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void PreviewSelectedLaunch()
+    {
+        if (GetSelectedRow() is not { } row || string.IsNullOrWhiteSpace(row.GameId))
+        {
+            MessageBox.Show(this, "请先选择一个有数据库记录的游戏。", "启动前预检", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            var factory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+            var game = new GameRepository(factory).GetById(row.GameId);
+            var result = game is null ? "数据库中找不到该游戏，无法预检。" : LaunchPreflight.Describe(game, VgcSettingsStore.LoadRequired());
+            MessageBox.Show(this, result, $"启动前预检 - {row.Name}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(this, $"预检失败：{error.Message}", "启动前预检", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private void OpenOnboardingWizard()
@@ -2161,11 +2694,33 @@ internal sealed class MainForm : Form
     {
         var selected = GetSelectedRows();
         var rows = selected
-            .Where(row => !string.IsNullOrWhiteSpace(row.GameId) && !IsRowRunning(row))
+            .Where(row => !string.IsNullOrWhiteSpace(row.GameId) && string.IsNullOrWhiteSpace(row.VniteId) && !IsRowRunning(row))
             .ToList();
         if (rows.Count == 0)
         {
-            MessageBox.Show(this, "请选择非运行中的 VGC 记录。", "批量删除插件记录", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "只能在这里删除未关联 Vnite 的孤立记录。已关联游戏请使用“解除 VGC 接管并删记录”。", "仅删孤立 VGC 记录", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var checkFactory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+        new MigrationRunner(checkFactory).Initialize();
+        var checkedGames = new GameRepository(checkFactory);
+        if (rows.Any(row => !string.IsNullOrWhiteSpace(checkedGames.GetById(row.GameId)?.VniteGameId)))
+        {
+            MessageBox.Show(this, "选中项中有仍关联 Vnite 的游戏。为避免留下失效启动字段，整个批次已停止；请改用“批量解除 VGC 接管并删记录”。", "仅删孤立 VGC 记录", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var saveProfiles = new SaveProfileRepository(checkFactory);
+        var protectedRows = rows.Where(row => saveProfiles.ListByGame(row.GameId).Count > 0).ToList();
+        if (protectedRows.Count > 0)
+        {
+            MessageBox.Show(this, $"{protectedRows.Count} 个游戏仍有 Save Profile。删除记录会抹掉存档备份索引，已停止整个批次。请先处理这些存档配置。", "存档索引保护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var quarantinedRows = rows.Where(row => ActiveQuarantineForGame(checkFactory, row.GameId).Count > 0).ToList();
+        if (quarantinedRows.Count > 0)
+        {
+            MessageBox.Show(this, $"{quarantinedRows.Count} 个游戏仍有活动隔离缓存。删除记录会丢失隔离区恢复索引，已停止整个批次。请先恢复隔离缓存或等待按保留期清理。", "隔离缓存保护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -2177,13 +2732,14 @@ internal sealed class MainForm : Form
             $"将跳过运行中：{running}\n" +
             $"涉及缓存大小：{totalCacheMb:N0} MB\n\n" +
             "将删除：\n" +
-            "- VGC SQLite 记录\n" +
+            "- VGC SQLite 记录及其关联索引\n" +
             "- 可确认归属的 Wrapper 快捷方式\n\n" +
             "将保留：\n" +
             "- NAS/G 盘游戏源文件\n" +
             "- Vnite 游戏条目、标题、封面、标签\n" +
             "- 用户存档\n" +
-            "- 本地缓存目录\n\n" +
+            "- 本地缓存目录、Manifest、存档备份 ZIP、日志与诊断报告\n\n" +
+            "仅适用于未关联 Vnite 的孤立记录。清理缓存请单独使用“清除缓存”。\n\n" +
             "不会设置永久忽略；如果游戏仍位于接管根目录，之后可以重新接管。\n\n是否继续？";
         if (MessageBox.Show(this, preview, "批量删除插件记录", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         if (MessageBox.Show(this, "请再次确认：只删除 VGC 插件记录，不删除游戏本体。", "批量删除插件记录", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
@@ -2241,21 +2797,6 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void ResetSelectedGame()
-    {
-        if (MessageBox.Show(
-                this,
-                "完全重置当前游戏会先走现有“删除插件记录”安全路径：备份数据库、删除 VGC 记录和可确认归属的 Wrapper 快捷方式。\n\n不会删除源游戏、Vnite 标题封面标签、存档或缓存目录。\n\n是否继续？",
-                "完全重置当前游戏",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning) != DialogResult.Yes)
-        {
-            return;
-        }
-
-        DeleteSelectedRecord();
-    }
-
     private void ShowDeleteFromVnitePreview()
     {
         if (GetSelectedRow() is not { } row)
@@ -2266,7 +2807,7 @@ internal sealed class MainForm : Form
 
         MessageBox.Show(
             this,
-            $"高级危险操作：从 Vnite 删除游戏条目。\n\n游戏：{row.Name}\nVnite ID：{row.VniteId}\n\n当前插件没有可靠确认 Vnite 删除 API 的用户确认语义，因此不会直接删除 Vnite 条目。\n请在 Vnite 本体中删除游戏条目；如只想让 VGC 重新生成接管记录，请使用“删除插件记录”。",
+            $"高级危险操作：从 Vnite 删除游戏条目。\n\n游戏：{row.Name}\nVnite ID：{row.VniteId}\n\n当前插件没有可靠确认 Vnite 删除 API 的用户确认语义，因此不会直接删除 Vnite 条目。\n请在 Vnite 本体中删除游戏条目；如需重新检测，请使用“清除后重新检测并接管”。",
             "从 Vnite 删除（预览）",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
@@ -2299,7 +2840,7 @@ internal sealed class MainForm : Form
             StartPosition = FormStartPosition.CenterParent
         };
         var combo = new ComboBox { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(12) };
-        combo.Items.AddRange(["跟随默认", "直接启动", "翻译优先 EXE", "MTool 批处理优先"]);
+        combo.Items.AddRange(["跟随默认", "直接启动", "翻译优先 EXE", "MTool 启动优先"]);
         combo.SelectedIndex = 0;
         var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Dock = DockStyle.Bottom };
         dialog.Controls.Add(combo);
@@ -2416,6 +2957,11 @@ internal sealed class MainForm : Form
 
     private void RequestClearTakeoverProperties(bool readopt, bool deletePluginRecord, bool dryRun)
     {
+        if (HasPendingCommand("clear-takeover"))
+        {
+            MessageBox.Show(this, "上一次清除接管请求仍在等待或处理中，请等待结果后再提交。", "清除接管属性", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
         var selected = GetSelectedRows();
         if (selected.Count == 0 && GetSelectedRow() is { } row)
         {
@@ -2442,20 +2988,48 @@ internal sealed class MainForm : Form
             return;
         }
 
+        if (deletePluginRecord && !dryRun)
+        {
+            var checkFactory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+            new MigrationRunner(checkFactory).Initialize();
+            var games = new GameRepository(checkFactory);
+            var profiles = new SaveProfileRepository(checkFactory);
+            var protectedRows = rows.Where(row =>
+            {
+                var game = games.GetById(row.GameId) ?? (!string.IsNullOrWhiteSpace(row.VniteId) ? games.GetByVniteGameId(row.VniteId) : null);
+                return game is not null && profiles.ListByGame(game.GameId).Count > 0;
+            }).ToList();
+            if (protectedRows.Count > 0)
+            {
+                MessageBox.Show(this, $"{protectedRows.Count} 个游戏有 Save Profile。删除 SQLite 记录会丢失存档备份索引，本次未提交。请先处理这些存档配置。", "存档索引保护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            var quarantinedRows = rows.Select(row => games.GetById(row.GameId) ?? (!string.IsNullOrWhiteSpace(row.VniteId) ? games.GetByVniteGameId(row.VniteId) : null))
+                .Where(game => game is not null)
+                .SelectMany(game => ActiveQuarantineForGame(checkFactory, game!.GameId))
+                .ToList();
+            if (quarantinedRows.Count > 0)
+            {
+                MessageBox.Show(this, $"选中游戏仍有 {quarantinedRows.Count} 个活动隔离缓存。删除记录会丢失恢复索引，本次未提交。\n\n隔离路径示例：{quarantinedRows[0].QuarantinePath}\n\n请先恢复隔离缓存或等待按保留期清理。", "隔离缓存保护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+        }
+
         var title = dryRun
             ? "扫描接管残留（Dry Run）"
             : readopt
-                ? "清除后重新接管"
+                ? "清除后重新检测并接管"
                 : deletePluginRecord
-                    ? "删除记录并清除接管属性"
-                    : "一键清除接管属性";
+                    ? "解除 VGC 接管并删记录（保留缓存）"
+                    : "清除 VGC 启动设置（保留记录）";
         var preview =
             $"将处理 {gameIds.Count} 个游戏。\n\n" +
-            "将清除：VGC Wrapper/.lnk、--game-id、启动器路径、追踪进程、PluginDB 接管映射。\n\n" +
-            "将保留：Vnite 游戏条目、标题、封面、标签、分类、有效 rootPath、NAS/G 盘游戏文件和用户存档。\n\n" +
+            "将清除：Vnite 中 VGC 的 Wrapper/.lnk、--game-id、启动器路径、追踪字段，以及 PluginDB 接管映射和可确认归属的快捷方式。\n\n" +
+            "将保留：Vnite 游戏条目及元数据、游戏根目录、NAS/G 盘源文件、用户存档、本地缓存、Manifest、备份 ZIP、日志和诊断报告。\n\n" +
+            "清除启动字段后，重新接管或手动设置启动程序前，Vnite 可能无法直接启动该游戏。清理缓存请另用“清除缓存”。\n\n" +
             (dryRun ? "本次只生成预览，不写入 Vnite。\n\n" : "") +
             (readopt ? "清除后会请求插件重新接管；多个启动程序不会自动选第一个，会进入待处理。\n\n" : "") +
-            (deletePluginRecord ? "同时会删除对应 VGC SQLite 记录；执行前控制台会先备份数据库。\n\n" : "") +
+            (deletePluginRecord ? "同时会删除对应 VGC SQLite 记录及关联索引；有 Save Profile 时已阻止。执行前会备份数据库。\n\n" : "") +
             "是否继续？";
         if (MessageBox.Show(this, preview, title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
 
@@ -2472,6 +3046,11 @@ internal sealed class MainForm : Form
             }
         }
 
+        if (HasPendingCommand("clear-takeover"))
+        {
+            MessageBox.Show(this, "另一窗口已经提交清除接管请求，本次未覆盖。", title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         var wasMaintenanceEnabled = IsMaintenanceModeEnabled();
         if (!wasMaintenanceEnabled)
         {
@@ -2480,25 +3059,53 @@ internal sealed class MainForm : Form
 
         Directory.CreateDirectory(_commandsRoot);
         var requestPath = Path.Combine(_commandsRoot, "clear-takeover-request.json");
+        var resultPath = Path.Combine(_commandsRoot, "clear-takeover-result.json");
+        var requestId = Guid.NewGuid().ToString("N");
+        var requestedUtc = DateTimeOffset.UtcNow.ToString("O");
         var payload = JsonSerializer.Serialize(new
         {
+            request_id = requestId,
             command = "clear-takeover-properties",
             apply = !dryRun,
             dry_run = dryRun,
             readopt,
             delete_plugin_record = deletePluginRecord,
             selected_game_ids = gameIds,
-            requested_utc = DateTimeOffset.UtcNow
+            requested_utc = requestedUtc
         }, new JsonSerializerOptions { WriteIndented = true });
+        WriteAllTextAtomic(resultPath, JsonSerializer.Serialize(new { status = "pending", request_id = requestId, requested_utc = requestedUtc }));
         WriteAllTextAtomic(requestPath, payload);
         _adoptStatus.Text = dryRun
             ? "已写入接管残留 Dry Run 请求；等待 Vnite 插件处理"
             : "已写入清除接管属性请求；等待 Vnite 插件处理";
         RecordOperation(dryRun ? "takeover_residue_dry_run_request" : "clear_takeover_properties_request", null, rows, $"已写入请求：{requestPath}", deletePluginRecord && _lastUndoBackupPath is not null ? [$"数据库备份：{_lastUndoBackupPath}"] : []);
 
-        var refreshTimer = new System.Windows.Forms.Timer { Interval = 12_000 };
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(90);
+        var refreshTimer = new System.Windows.Forms.Timer { Interval = 1_000 };
         refreshTimer.Tick += (_, _) =>
         {
+            string? summary = null;
+            var success = false;
+            if (File.Exists(resultPath))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(resultPath));
+                    var result = document.RootElement;
+                    if (GetString(result, "request_id") == requestId)
+                    {
+                        success = result.TryGetProperty("success", out var completed) && completed.ValueKind == JsonValueKind.True;
+                        summary = success
+                            ? $"已完成：{GetInt(result, "cleared_count")} 个；残留 {GetInt(result, "residue_count")} 项。"
+                            : $"处理未全部成功：失败 {GetInt(result, "failed_count")} 个。{GetString(result, "error")}";
+                    }
+                }
+                catch (Exception error) when (error is IOException or JsonException)
+                {
+                }
+            }
+            if (summary is null && DateTimeOffset.UtcNow < deadline) return;
+            summary ??= "等待处理结果超时，无法确认是否完成。请查看接管残留诊断后再操作。";
             refreshTimer.Stop();
             refreshTimer.Dispose();
             if (!wasMaintenanceEnabled && IsMaintenanceModeEnabled())
@@ -2506,9 +3113,10 @@ internal sealed class MainForm : Form
                 SetMaintenanceMode(false, "");
             }
             LoadStatus();
+            _adoptStatus.Text = summary;
+            MessageBox.Show(this, summary, title, MessageBoxButtons.OK, success ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         };
         refreshTimer.Start();
-        MessageBox.Show(this, $"已提交：{title}。\nVnite 插件通常 10 秒内处理；控制台会自动刷新一次。", title, MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void RecordOperation(string operationType, string? gameId, IReadOnlyList<GameRow> rows, string changedSummary, IReadOnlyList<string> warnings)
@@ -2825,7 +3433,7 @@ internal sealed class MainForm : Form
         var diagnostics = ReadTakeoverResidueDiagnostics();
         if (diagnostics is null)
         {
-            MessageBox.Show(this, "暂无接管残留诊断。请先执行“扫描接管残留（Dry Run）”或“一键清除接管属性”。", "接管残留诊断", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "暂无接管残留诊断。请先执行“扫描接管残留（Dry Run）”或“清除 VGC 启动设置（保留记录）”。", "接管残留诊断", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -2862,8 +3470,8 @@ internal sealed class MainForm : Form
 
         lines.Add("");
         lines.Add("建议操作：");
-        lines.Add("- 先对少量游戏执行“一键清除接管属性”。");
-        lines.Add("- 清除后状态会回到待检测；再执行“清除后重新接管”或“一键修复接管”。");
+        lines.Add("- 先对少量游戏执行“清除 VGC 启动设置（保留记录）”。");
+        lines.Add("- 清除后状态会回到待检测；再执行“清除后重新检测并接管”或“一键修复接管”。");
         lines.Add("- 多启动程序游戏不会自动选第一个，需要在手动修复里确认。");
         File.WriteAllLines(reportPath, lines);
         Process.Start(new ProcessStartInfo { FileName = reportPath, UseShellExecute = true });
@@ -2919,7 +3527,7 @@ internal sealed class MainForm : Form
         lines.Add($"默认启动模式：{launchMode switch
         {
             VgcLaunchMode.TranslationPreferred => "翻译 EXE 优先",
-            VgcLaunchMode.MTool => "MTool 批处理优先",
+            VgcLaunchMode.MTool => "MTool 启动优先",
             _ => "直接启动"
         }}");
         if (launchMode == VgcLaunchMode.MTool)
@@ -2938,6 +3546,19 @@ internal sealed class MainForm : Form
         AddFileCheck(lines, "Agent", Path.Combine(binRoot, "VniteGameCache.Agent.exe"));
         AddFileCheck(lines, "Wrapper", Path.Combine(binRoot, "VniteGameCache.Wrapper.exe"));
         AddFileCheck(lines, "ControlPanel", Path.Combine(binRoot, "VniteGameCache.ControlPanel.exe"));
+        lines.Add("");
+
+        var distBinRoot = Path.Combine(_projectRoot, "dist", "current", "bin");
+        lines.Add("本地构建输出与 dist/current（须先完成正式构建）：");
+        foreach (var component in new[] { "Agent", "Wrapper", "ControlPanel" })
+        {
+            var targetFramework = component == "ControlPanel" ? "net8.0-windows" : "net8.0";
+            var fileName = $"VniteGameCache.{component}.dll";
+            AddFileComparison(lines, component,
+                Path.Combine(_projectRoot, "src", $"VniteGameCache.{component}", "bin", "Release", targetFramework, fileName),
+                Path.Combine(distBinRoot, fileName));
+        }
+        lines.Add($"当前控制台来自 dist/current：{Path.GetFullPath(binRoot).TrimEnd(Path.DirectorySeparatorChar).Equals(Path.GetFullPath(distBinRoot).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)}");
         lines.Add("");
 
         var installedManifest = Path.Combine(
@@ -2959,6 +3580,13 @@ internal sealed class MainForm : Form
         }
         lines.Add($"已安装插件：{ReadInstalledPluginVersion() ?? "未发现"}");
         lines.Add($"已安装插件清单：{installedManifest} | {(File.Exists(installedManifest) ? "存在" : "不存在")}");
+        var installedPluginRoot = Path.GetDirectoryName(installedManifest)!;
+        var distPluginRoot = Path.Combine(_projectRoot, "dist", "current", "plugin");
+        foreach (var fileName in new[] { "index.js", "manifest.json", "package.json" })
+            AddFileComparison(lines, $"插件 {fileName}", Path.Combine(distPluginRoot, fileName), Path.Combine(installedPluginRoot, fileName));
+        lines.Add(Process.GetProcessesByName("Vnite").Length > 0
+            ? "Vnite 运行中：磁盘文件比对不能证明当前进程已重新加载插件。"
+            : "Vnite 未运行：下次启动后才可验证进程实际加载状态。");
         lines.Add("");
 
         var latestAdopt = Path.Combine(_diagnosticsRoot, "adopt-existing-latest.json");
@@ -2997,7 +3625,7 @@ internal sealed class MainForm : Form
 
         var confirm = MessageBox.Show(
             this,
-            $"将清除本地 SSD 缓存。\n\n游戏：{row.Name}\n缓存目录：{row.CacheRoot}\n\n不会删除 NAS/G 盘源游戏，不会删除 Vnite 标题、封面、标签，不会删除 VGC 游戏记录。\n默认会进入 Quarantine；如果 Quarantine 与缓存在同一磁盘，不会立即释放空间。\n\n是否继续？",
+            $"将清除本地 SSD 缓存。\n\n游戏：{row.Name}\n缓存目录：{row.CacheRoot}\n缓存记录大小：{row.CacheMb:N0} MB（数据库记录值，非实时磁盘统计）\n\n不会删除 NAS/G 盘源游戏，不会删除 Vnite 标题、封面、标签，不会删除 VGC 游戏记录。\n默认会将上述缓存目录移入 Quarantine；如果 Quarantine 与缓存在同一磁盘，不会立即释放空间。\n\n是否继续？",
             "清除缓存",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Warning);
@@ -3034,6 +3662,45 @@ internal sealed class MainForm : Form
         catch (Exception error)
         {
             MessageBox.Show(this, $"清除缓存失败：{error.Message}", "清除缓存", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void RestoreSelectedQuarantine()
+    {
+        if (GetSelectedRow() is not { } row || IsRowRunning(row)) return;
+        try
+        {
+            var factory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+            new MigrationRunner(factory).Initialize();
+            var entry = ActiveQuarantineForGame(factory, row.GameId)
+                .OrderByDescending(item => item.CreatedUtc)
+                .FirstOrDefault();
+            if (entry is null)
+            {
+                MessageBox.Show(this, "这个游戏没有可恢复的隔离缓存。", "恢复隔离缓存", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (!Directory.Exists(entry.QuarantinePath))
+            {
+                MessageBox.Show(this, $"隔离目录已不存在，无法恢复：\n{entry.QuarantinePath}\n\n记录仍保留，请先检查该路径和磁盘连接。", "恢复隔离缓存", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (Directory.Exists(entry.OriginalCacheRoot) && Directory.EnumerateFileSystemEntries(entry.OriginalCacheRoot).Any())
+            {
+                if (MessageBox.Show(this, $"目标缓存目录非空，恢复已停止，未覆盖任何文件：\n{entry.OriginalCacheRoot}\n\n点“是”打开目录查看内容。", "恢复隔离缓存", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                    OpenFolder(entry.OriginalCacheRoot);
+                return;
+            }
+            if (MessageBox.Show(this, $"将隔离缓存移回原路径：\n{entry.QuarantinePath}\n→ {entry.OriginalCacheRoot}\n\n目标目录必须为空。是否继续？", "恢复隔离缓存", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            var cacheService = CreateCacheService(factory);
+            var management = new CacheManagementService(factory, cacheService, VgcSettingsStore.LoadRequired().ProtectConfigFiles);
+            var result = management.RestoreQuarantine(entry.QuarantineId);
+            LoadStatus();
+            MessageBox.Show(this, $"已恢复到：{result.RestoredPath}。请检查游戏启动和存档。", "恢复隔离缓存", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(this, $"恢复失败：{error.Message}", "恢复隔离缓存", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -3110,7 +3777,7 @@ internal sealed class MainForm : Form
         {
             $"VGC 重复游戏扫描 - {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}",
             "",
-            "此报告只扫描，不自动合并或删除。不确定项请在“游戏管理”里选中后使用“删除插件记录”。",
+            "此报告只扫描，不自动合并或删除。不确定项请在“游戏管理”里选中后使用“解除 VGC 接管并删记录”，或先进行单游戏诊断。",
             "",
             $"重复组：{groups.Count}",
             ""
@@ -3197,7 +3864,24 @@ internal sealed class MainForm : Form
             return;
         }
 
+        if (!string.IsNullOrWhiteSpace(game.VniteGameId) || !string.IsNullOrWhiteSpace(row.VniteId))
+        {
+            MessageBox.Show(this, "该记录关联了 Vnite 游戏。仅删除 SQLite 会留下失效启动字段；请使用“解除 VGC 接管并删记录（保留缓存）”。", "仅删孤立 VGC 记录", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         var saveProfiles = new SaveProfileRepository(factory).ListByGame(game.GameId);
+        if (saveProfiles.Count > 0)
+        {
+            MessageBox.Show(this, $"该游戏有 {saveProfiles.Count} 个 Save Profile。删除记录会连带删除存档备份索引，备份 ZIP 虽仍在磁盘上却无法从控制台直接恢复；本次已停止。", "存档索引保护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var activeQuarantine = ActiveQuarantineForGame(factory, game.GameId);
+        if (activeQuarantine.Count > 0)
+        {
+            MessageBox.Show(this, $"该游戏仍有 {activeQuarantine.Count} 个活动隔离缓存。删除记录会丢失恢复索引，本次已停止。\n\n隔离路径：{activeQuarantine[0].QuarantinePath}\n\n请先恢复隔离缓存或等待按保留期清理。", "隔离缓存保护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         var warnings = new List<string>();
         if (game.CacheStatus is CacheStatus.Running or CacheStatus.Checking or CacheStatus.Copying or CacheStatus.Verifying)
         {
@@ -3205,7 +3889,6 @@ internal sealed class MainForm : Form
         }
         if (RuntimeGameLock.IsHeld(game.GameId)) warnings.Add("存在运行锁");
         if (game.IsPinned) warnings.Add("此游戏已固定");
-        if (saveProfiles.Count > 0) warnings.Add($"存在 {saveProfiles.Count} 个 Save Profile");
         if (game.ContainsPossibleSaveData) warnings.Add("检测到可能存档/用户数据");
         if (game.PendingManualSaveBackup) warnings.Add("存在待手动备份存档标记");
         if (game.CacheSizeBytes > 0 || Directory.Exists(game.CacheRoot)) warnings.Add("存在缓存记录或缓存目录");
@@ -3215,11 +3898,11 @@ internal sealed class MainForm : Form
             : $"注意：\n- {string.Join("\n- ", warnings)}\n";
         var confirm = MessageBox.Show(
             this,
-            $"将临时删除 VGC 对这一个游戏的 SQLite 接管记录，并尝试删除对应 Wrapper 快捷方式。\n\n" +
+            $"将删除这一个孤立游戏的 VGC SQLite 记录及关联索引，并尝试删除对应 Wrapper 快捷方式。\n\n" +
             $"游戏：{game.DisplayName}\nGame ID：{game.GameId}\nVnite ID：{game.VniteGameId ?? ""}\n\n" +
             $"{warningText}\n" +
             "这不会设置永久忽略；如果游戏仍在接管根目录，之后可以重新接管并生成新记录。\n" +
-            "不会删除 NAS/G 盘游戏源文件。\n不会删除 Vnite 标题、封面、标签。\n不会删除缓存目录；缓存需要另用“缓存状态/缓存目录”相关功能处理。\n\n是否继续？",
+            "不会删除 NAS/G 盘游戏源文件、Vnite 元数据、本地缓存、Manifest、存档备份 ZIP、日志或诊断报告。清理缓存请单独使用“清除缓存”。\n\n是否继续？",
             "删除插件记录",
             MessageBoxButtons.YesNo,
             warnings.Count == 0 ? MessageBoxIcon.Question : MessageBoxIcon.Warning);
@@ -3552,6 +4235,11 @@ internal sealed class MainForm : Form
         return backupPath;
     }
 
+    private static IReadOnlyList<QuarantineEntryRecord> ActiveQuarantineForGame(SqliteConnectionFactory factory, string gameId) =>
+        new QuarantineRepository(factory).ListByGame(gameId)
+            .Where(entry => entry.RestoredUtc is null && entry.DeletedUtc is null)
+            .ToArray();
+
     private static string TryDeleteShortcutForGame(string gameId, string shortcutPath)
     {
         var candidates = new List<string>();
@@ -3560,23 +4248,35 @@ internal sealed class MainForm : Form
         if (!string.IsNullOrWhiteSpace(detected)) candidates.Add(detected);
 
         var launcherRoot = Path.Combine(VgcSettingsStore.LocalAppDataRoot, "launchers");
+        if (Directory.Exists(launcherRoot))
+        {
+            candidates.AddRange(Directory.EnumerateFiles(launcherRoot, "*.lnk", SearchOption.TopDirectoryOnly)
+                .Where(candidate => Path.GetFileName(candidate).Contains(gameId, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        var deleted = new List<string>();
+        var skipped = new List<string>();
         foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             try
             {
                 if (!File.Exists(candidate)) continue;
-                if (!IsPathUnder(candidate, launcherRoot)) return $"跳过非 VGC 快捷方式：{candidate}";
-                if (!Path.GetFileName(candidate).Contains(gameId, StringComparison.OrdinalIgnoreCase)) return $"跳过无法确认归属的快捷方式：{candidate}";
+                if (!IsPathUnder(candidate, launcherRoot) || !Path.GetFileName(candidate).Contains(gameId, StringComparison.OrdinalIgnoreCase))
+                {
+                    skipped.Add(candidate);
+                    continue;
+                }
                 File.Delete(candidate);
-                return $"已删除 {candidate}";
+                deleted.Add(candidate);
             }
             catch (Exception error)
             {
-                return $"删除失败：{candidate}；{error.Message}";
+                skipped.Add($"{candidate}：{error.Message}");
             }
         }
 
-        return "未发现对应快捷方式";
+        return $"已删除 {deleted.Count} 个；未删除 {skipped.Count} 个" +
+            (skipped.Count == 0 ? "" : $"：{string.Join("；", skipped)}");
     }
 
     private void WriteManualDeleteReport(GameRecord game, string backupPath, string shortcutResult, IReadOnlyList<string> warnings)
@@ -3807,7 +4507,8 @@ internal sealed class MainForm : Form
             "",
             "删除语义：",
             "- “清除缓存”：只处理本地缓存。",
-            "- “删除插件记录”：只删除 VGC SQLite 记录和可确认的 VGC 快捷方式。",
+            "- “解除 VGC 接管并删记录”：先清除 Vnite 启动引用，再删除 VGC SQLite 记录；保留缓存、Manifest 和备份 ZIP。",
+            "- “仅删孤立 VGC 记录”：仅适用于未关联 Vnite、没有 Save Profile 的记录。",
             "- “扫描过期记录/扫描重复游戏”：只生成报告，不自动删除。"
         };
         return string.Join(Environment.NewLine, lines);
@@ -3924,7 +4625,33 @@ internal sealed class MainForm : Form
         OpenFolder(Path.Combine(VgcSettingsStore.LocalAppDataRoot, "mtool-links"));
     }
 
-    private void OpenSelectedMToolTemplate()
+    private void OpenSelectedGameForMTool()
+    {
+        if (GetSelectedRow() is not { } row) return;
+
+        var gameExe = row.ExecutablePath;
+        if (string.IsNullOrWhiteSpace(gameExe) || !File.Exists(gameExe) ||
+            Path.GetFileName(gameExe).StartsWith("MTool_", StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this, "无法确认该游戏的原始启动 EXE。请先检查“启动程序”，不要把 MTool_Game.exe 添加为游戏主程序。", "MTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var mtoolExe = VgcSettingsStore.LoadWithDiagnostics().Settings.MToolExecutablePath;
+        if (string.IsNullOrWhiteSpace(mtoolExe) || !File.Exists(mtoolExe))
+        {
+            MessageBox.Show(this, "请先在插件设置中配置有效的新版 MTool 路径。", "MTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        OpenMToolCenter();
+        OpenFileLocation(gameExe);
+        MessageBox.Show(this,
+            $"已打开新版 MTool 并定位游戏主程序：{Environment.NewLine}{gameExe}{Environment.NewLine}{Environment.NewLine}请将选中的 EXE 拖入 MTool，或在 MTool 中点选添加。是否更新旧文件由 MTool 决定；VGC 不直接覆盖游戏目录。",
+            "在 MTool 中添加游戏", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void OpenSelectedMToolArtifact()
     {
         if (GetSelectedRow() is not { } row)
         {
@@ -3932,14 +4659,14 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var templatePath = FindMToolTemplatePath(row.CacheRoot, row.SourceRoot);
-        if (templatePath is null)
+        var artifact = DetectMToolArtifact(row.CacheRoot, ContentSourceRoot(row));
+        if (artifact?.Kind is not ("bat" or "exe"))
         {
-            MessageBox.Show(this, "未在缓存目录或游戏根目录发现已识别的 MTool 启动模板。", "MTool", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "未在缓存目录或游戏根目录发现可识别的 MTool 启动文件。", "MTool", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        OpenFileLocation(templatePath);
+        OpenFileLocation(artifact.Path);
     }
 
     private static string BuildMToolDetail(GameRow row)
@@ -3947,7 +4674,7 @@ internal sealed class MainForm : Form
         var settings = VgcSettingsStore.LoadWithDiagnostics().Settings;
         var defaultMode = VgcSettingsStore.ParseLaunchMode(settings.DefaultLaunchMode);
         var effectiveMode = row.LaunchMode == "跟随默认" ? defaultMode.ToString() : row.LaunchMode;
-        var templatePath = FindMToolTemplatePath(row.CacheRoot, row.SourceRoot);
+        var templatePath = FindMToolTemplatePath(row.CacheRoot, ContentSourceRoot(row));
         var template = templatePath is null ? null : TryReadMToolTemplate(templatePath);
         var executablePath = settings.MToolExecutablePath ?? "";
         var mtoolRoot = string.IsNullOrWhiteSpace(executablePath) ? "" : Path.GetDirectoryName(executablePath) ?? "";
@@ -3957,6 +4684,8 @@ internal sealed class MainForm : Form
         var lines = new List<string>
         {
             $"有效启动模式：{effectiveMode}",
+            $"MTool 能力：{DescribeMToolCapability(row.CacheRoot, ContentSourceRoot(row))}",
+            $"翻译程序：{DescribeTranslationCapability(ContentSourceRoot(row), row.CacheRoot, row.ExecutablePath)}",
             $"MTool.exe：{(File.Exists(executablePath) ? executablePath : "未配置或不存在")}",
             $"启动模板：{(templatePath is null ? "未发现" : templatePath)}"
         };
@@ -3965,11 +4694,11 @@ internal sealed class MainForm : Form
         {
             lines.Add($"模板目标程序：{template.GameExecutableName}");
             lines.Add($"当前组件：inject={(File.Exists(injectPath) ? "存在" : "缺失")}; loader={(File.Exists(loaderPath) ? "存在" : "缺失")}; nw={(File.Exists(nwPath) ? "存在" : "缺失")}");
-            lines.Add("说明：VGC 只把 BAT 当模板，启动时改用当前 MTool 组件和 SSD 缓存副本，不执行旧绝对路径。");
+            lines.Add("说明：MTool 模式优先使用已识别 BAT 模板，改用当前 MTool 组件启动 SSD 缓存副本；不执行旧绝对路径。");
         }
         else
         {
-            lines.Add("说明：未检测到 MTool 模板时，MTool 模式会退回翻译优先/直接启动。最好只对确实有“与工具一同启动.bat”的游戏启用 MTool。");
+            lines.Add("说明：没有已识别 BAT 时回退到翻译 EXE 优先；若无配对翻译 EXE，可启动缓存目录的 MTool_Game.exe，仍不代表已升级到当前 MTool。实际进程停止行为仍需验收。");
         }
 
         return string.Join("\r\n", lines);
@@ -3988,6 +4717,90 @@ internal sealed class MainForm : Form
                     return candidate;
                 }
             }
+        }
+
+        return null;
+    }
+
+    private static string DescribeMToolCapability(string cacheRoot, string sourceRoot)
+    {
+        var artifact = DetectMToolArtifact(cacheRoot, sourceRoot);
+        if (artifact is not null) return artifact.Kind switch
+        {
+            "bat" => "BAT 模板可解析" + (HasMToolGameExecutable(cacheRoot, sourceRoot) ? "、MTool_Game.exe 存在" : ""),
+            "exe" => "MTool_Game.exe 存在（启动待验证）",
+            _ => "BAT 模板未识别" + (HasMToolGameExecutable(cacheRoot, sourceRoot) ? "、MTool_Game.exe 存在" : "")
+        };
+        return Directory.Exists(cacheRoot) || Directory.Exists(sourceRoot) ? "未发现" : "目录不可用";
+    }
+
+    private static string DescribeTranslationCapability(string sourceRoot, string cacheRoot, string executablePath)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath) || !Path.IsPathRooted(executablePath)) return "主程序待确认";
+        try
+        {
+            var sourceExecutable = Path.GetFullPath(executablePath);
+            var inspectedExecutable = sourceExecutable;
+            if (!string.IsNullOrWhiteSpace(sourceRoot) && !string.IsNullOrWhiteSpace(cacheRoot))
+            {
+                var relative = Path.GetRelativePath(Path.GetFullPath(sourceRoot), sourceExecutable);
+                if (!Path.IsPathRooted(relative) && relative != ".." &&
+                    !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                {
+                    var cacheExecutable = Path.Combine(cacheRoot, relative);
+                    if (File.Exists(cacheExecutable)) inspectedExecutable = cacheExecutable;
+                }
+            }
+
+            if (!File.Exists(inspectedExecutable)) return "主程序不可用";
+            var selected = new VniteGameCache.Wrapper.LaunchPreferenceResolver()
+                .SelectPreferredTranslationExecutable(inspectedExecutable);
+            if (Path.GetFullPath(selected).Equals(Path.GetFullPath(inspectedExecutable), StringComparison.OrdinalIgnoreCase))
+                return Path.GetFileName(inspectedExecutable).Equals("MTool_Game.exe", StringComparison.OrdinalIgnoreCase)
+                    ? "当前主程序是 MTool_Game.exe（启动待验证）"
+                    : "未发现其他候选";
+            var name = Path.GetFileName(selected);
+            return name.Equals("MTool_Game.exe", StringComparison.OrdinalIgnoreCase)
+                ? "MTool_Game.exe 可用（启动待验证）"
+                : $"候选 {name}（启动待验证）";
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return "扫描失败";
+        }
+    }
+
+    private static bool HasMToolGameExecutable(params string[] roots) => roots
+        .Where(Directory.Exists)
+        .Any(root => File.Exists(Path.Combine(root, "MTool_Game.exe")));
+
+    private static MToolArtifact? DetectMToolArtifact(params string[] roots)
+    {
+        foreach (var root in roots.Where(Directory.Exists))
+        {
+            foreach (var name in MToolBatchNames)
+            {
+                var batchPath = Path.Combine(root, name);
+                if (!File.Exists(batchPath)) continue;
+                var template = TryReadMToolTemplate(batchPath);
+                if (template is not null && !string.IsNullOrWhiteSpace(template.GameExecutableName) && !string.IsNullOrWhiteSpace(template.LoaderRelativePath))
+                    return new MToolArtifact("bat", batchPath);
+            }
+        }
+
+        foreach (var root in roots.Where(Directory.Exists))
+        {
+            foreach (var name in MToolBatchNames)
+            {
+                var batchPath = Path.Combine(root, name);
+                if (File.Exists(batchPath)) return new MToolArtifact("unverified-bat", batchPath);
+            }
+        }
+
+        foreach (var root in roots.Where(Directory.Exists))
+        {
+            var executablePath = Path.Combine(root, "MTool_Game.exe");
+            if (File.Exists(executablePath)) return new MToolArtifact("exe", executablePath);
         }
 
         return null;
@@ -4160,7 +4973,7 @@ internal sealed class MainForm : Form
             : $"{Path.GetFileName(latestRobocopyLog)}：{progress}% ，更新时间 {updated}";
     }
 
-    private IReadOnlyDictionary<string, string> ReadLaunchStates()
+    private IReadOnlyDictionary<string, string> ReadLaunchStates(Dictionary<string, string> launchEvidence)
     {
         var states = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (!Directory.Exists(_logRoot)) return states;
@@ -4175,8 +4988,28 @@ internal sealed class MainForm : Form
                     var root = document.RootElement;
                     var gameId = GetString(root, "game_id") ?? GetString(root, "gameId");
                     if (string.IsNullOrWhiteSpace(gameId)) continue;
+                    if (GetString(root, "component") != "wrapper") continue;
                     var eventName = GetString(root, "event") ?? "";
-                    states[gameId] = TranslateLaunchEvent(eventName);
+                    if (eventName == "received_request") launchEvidence.Remove(gameId);
+                    if (eventName == "launch_mode_resolved")
+                    {
+                        var mode = GetString(root, "result") ?? "";
+                        var target = GetString(root, "executable_path") ?? "";
+                        var reason = GetString(root, "error") ?? "";
+                        launchEvidence[gameId] = $"解析为 {mode}；跟踪目标：{target}；{reason}";
+                    }
+                    else if (eventName == "game_started")
+                    {
+                        var pid = GetInt(root, "process_id");
+                        var time = GetString(root, "timestamp_utc") ?? "";
+                        launchEvidence[gameId] = $"{launchEvidence.GetValueOrDefault(gameId, "未记录解析结果")}；启动已发起，PID {pid}，{time}（游戏画面待验证）";
+                    }
+                    else if (eventName == "game_process_tree_exited")
+                    {
+                        launchEvidence[gameId] = $"{launchEvidence.GetValueOrDefault(gameId, "未记录解析结果")}；监控已结束（派生进程待验证）";
+                    }
+                    if (eventName is "received_request" or "agent_started" or "agent_ready" or "launch_mode_resolved" or "game_started" or "game_process_tree_exited" or "launch_failed" or "agent_rejected" or "duplicate_launch_ignored")
+                        states[gameId] = TranslateLaunchEvent(eventName);
                 }
                 catch (JsonException)
                 {
@@ -4192,7 +5025,9 @@ internal sealed class MainForm : Form
         "received_request" => "收到启动请求",
         "agent_started" => "Agent 已启动",
         "agent_ready" => "缓存已就绪",
-        "game_started" => "游戏已启动",
+        "game_started" => "游戏进程已启动（画面待确认）",
+        "launch_mode_resolved" => "启动模式已解析",
+        "game_process_tree_exited" => "监控已结束，派生进程待验证",
         "wrapper_detached" => "已交给游戏进程",
         "duplicate_launch_ignored" => "已在运行，忽略重复启动",
         "launch_failed" => "启动失败",
@@ -4385,6 +5220,62 @@ internal sealed class MainForm : Form
         return $"{name} {version}";
     }
 
+    private string DescribePluginInstallation(string projectRoot, string? installedVersion)
+    {
+        if (installedVersion is null)
+        {
+            return "未发现已安装插件";
+        }
+
+        var installedRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "vnite", "app", "plugins", "vnite-game-cache");
+        var packageRoot = Path.Combine(projectRoot, "dist", "current", "plugin");
+        var names = new[] { "index.js", "manifest.json", "package.json" };
+        string packageState;
+        try
+        {
+            packageState = names.All(name => File.Exists(Path.Combine(packageRoot, name)))
+                ? names.All(name => File.Exists(Path.Combine(installedRoot, name)) &&
+                    FileHashesMatch(Path.Combine(packageRoot, name), Path.Combine(installedRoot, name)))
+                    ? "与 dist/current 一致"
+                    : "与 dist/current 不一致"
+                : "未找到可比对的 dist/current 插件包";
+        }
+        catch (IOException)
+        {
+            packageState = "文件校验失败";
+        }
+        catch (UnauthorizedAccessException)
+        {
+            packageState = "文件校验失败";
+        }
+
+        var buildId = "未知";
+        try
+        {
+            var entry = Path.Combine(installedRoot, "index.js");
+            if (File.Exists(entry))
+            {
+                using var stream = File.OpenRead(entry);
+                buildId = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream))[..8];
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+
+        var vniteRunning = Process.GetProcessesByName("Vnite").Length > 0;
+        return $"已安装 {installedVersion}（插件指纹 {buildId}）；安装文件{packageState}；Vnite {(vniteRunning ? "运行中，当前进程加载版本未验证" : "未运行，启动后才会加载插件")}；维护模式 {(IsMaintenanceModeEnabled() ? "已开启" : "关闭")}";
+    }
+
+    private static bool FileHashesMatch(string first, string second)
+    {
+        using var firstStream = File.OpenRead(first);
+        using var secondStream = File.OpenRead(second);
+        return System.Security.Cryptography.SHA256.HashData(firstStream)
+            .SequenceEqual(System.Security.Cryptography.SHA256.HashData(secondStream));
+    }
+
     private static string? GetString(JsonElement element, string name)
     {
         return element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String
@@ -4434,6 +5325,29 @@ internal sealed class MainForm : Form
     private static void AddFileCheck(List<string> lines, string name, string path)
     {
         lines.Add($"{name}：{path} | {(File.Exists(path) ? "存在" : "不存在")}");
+    }
+
+    private static void AddFileComparison(List<string> lines, string name, string first, string second)
+    {
+        lines.Add($"{name}：构建/发布 {first} | 当前/安装 {second}");
+        if (!File.Exists(first) || !File.Exists(second))
+        {
+            lines.Add("  无法比较：至少一个文件不存在");
+            return;
+        }
+
+        try
+        {
+            using var firstStream = File.OpenRead(first);
+            using var secondStream = File.OpenRead(second);
+            var firstHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(firstStream));
+            var secondHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(secondStream));
+            lines.Add($"  SHA256：{firstHash} / {secondHash} | {(firstHash == secondHash ? "一致" : "不一致")}");
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            lines.Add($"  校验失败：{error.Message}");
+        }
     }
 
     private static IEnumerable<string> TailLines(string path, int maxLines)
@@ -4703,6 +5617,86 @@ internal sealed class MainForm : Form
         string RelativePath,
         GameLaunchCandidateRecord Candidate);
 
+    private sealed record MToolArtifact(string Kind, string Path);
+
+    private static string ContentSourceRoot(GameRow row) =>
+        string.IsNullOrWhiteSpace(row.ArchivePath) ? row.SourceRoot : row.CacheRoot;
+
+    private static bool ArchiveAwaitingExtraction(GameRow row) =>
+        !string.IsNullOrWhiteSpace(row.ArchivePath) &&
+        !File.Exists(Path.Combine(row.CacheRoot, ".vgc-archive-ready.json"));
+
+    private static string DescribeGameSpaceUsage(GameRow row)
+    {
+        var lines = new List<string> { "空间占用（不扫描游戏目录）：" };
+        if (!string.IsNullOrWhiteSpace(row.ArchivePath))
+        {
+            try
+            {
+                var source = new FileInfo(row.ArchivePath);
+                lines.Add(source.Exists
+                    ? $"- 源压缩包：{ToMb(source.Length):N0} MB（当前文件大小；不属于缓存）"
+                    : "- 源压缩包：不可访问");
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                lines.Add("- 源压缩包：无法读取大小");
+            }
+        }
+        lines.Add(Directory.Exists(row.CacheRoot)
+            ? $"- 本地缓存：{row.CacheMb:N0} MB（数据库记录值，可能不是实时大小）"
+            : "- 本地缓存：目录不存在；数据库记录值不代表当前占用");
+        if (!string.IsNullOrWhiteSpace(row.GameId))
+        {
+            try
+            {
+                var factory = new SqliteConnectionFactory(new DatabaseOptions(VgcSettingsStore.ResolveDatabasePath()));
+                var entries = ActiveQuarantineForGame(factory, row.GameId);
+                var present = entries.Where(entry => Directory.Exists(entry.QuarantinePath)).ToArray();
+                lines.Add($"- 隔离缓存：{ToMb(present.Sum(entry => Math.Max(0, entry.SizeBytes))):N0} MB（{present.Length} 份，隔离索引记录值）" +
+                    (entries.Count == present.Length ? "" : $"；另有 {entries.Count - present.Length} 份目录不可访问"));
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Microsoft.Data.Sqlite.SqliteException)
+            {
+                lines.Add("- 隔离缓存：索引暂时无法读取");
+            }
+        }
+        return string.Join("\r\n", lines);
+    }
+
+    private static string DescribeArchiveSourceSummary(GameRow row)
+    {
+        try
+        {
+            var source = new FileInfo(row.ArchivePath);
+            var sourceStatus = source.Exists
+                ? $"可访问（{ToMb(source.Length):N0} MB，源包本身不计入缓存占用）"
+                : "不可访问；请检查磁盘连接或原路径";
+            var preparation = ArchiveAwaitingExtraction(row)
+                ? source.Exists ? "下次启动需要从源包解压到缓存" : "尚未解压，源包不可访问，暂时无法准备游戏"
+                : source.Exists ? "下次启动可使用现有缓存" : "现有缓存可能可用；清理后无法从原路径重建";
+            return $"压缩包来源：{sourceStatus}\r\n下次启动：{preparation}";
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return "压缩包来源：无法检查；请核对路径和访问权限\r\n下次启动：状态待确认";
+        }
+    }
+
+    private static string DescribeArchivePreparation(string cacheRoot)
+    {
+        var markerPath = Path.Combine(cacheRoot, ".vgc-archive-ready.json");
+        if (!File.Exists(markerPath)) return "尚未准备";
+        try
+        {
+            using var marker = JsonDocument.Parse(File.ReadAllText(markerPath));
+            if (marker.RootElement.TryGetProperty("PrepareDurationMs", out var duration) &&
+                duration.TryGetInt64(out var milliseconds)) return $"{milliseconds / 1000d:N1} 秒（最近一次完整准备）";
+        }
+        catch (Exception error) when (error is IOException or JsonException) { }
+        return "未记录（旧缓存可正常使用）";
+    }
+
     private sealed record GameRow(
         string StatusIcon,
         string Name,
@@ -4721,7 +5715,10 @@ internal sealed class MainForm : Form
         string CacheRoot,
         string ExecutablePath,
         string ShortcutPath,
-        string CandidatePrograms);
+        string CandidatePrograms,
+        string TranslationStatus = "",
+        string LaunchEvidence = "",
+        string ArchivePath = "");
 
     private sealed record AdoptDiagnostics(
         string Status,

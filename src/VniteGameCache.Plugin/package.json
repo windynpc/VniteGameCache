@@ -1,7 +1,7 @@
 {
   "id": "vnite-game-cache",
   "name": "Vnite 游戏缓存",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "将 NAS/HDD 游戏自动缓存到本地 SSD，并通过 Wrapper 启动。",
   "author": "Vnite 游戏缓存",
   "license": "MIT",
@@ -45,6 +45,16 @@
       }
     },
     {
+      "id": "autoDiscoverArchives",
+      "title": "自动发现明确的游戏压缩包",
+      "default": false,
+      "description": "每 15 分钟只查看 NAS 游戏库根目录第一层的新 ZIP/7z/RAR；仅安全且主程序唯一时自动添加。名称使用压缩包文件名，其他候选需手动确认。",
+      "type": "boolean",
+      "controlOptions": {
+        "controlType": "switch"
+      }
+    },
+    {
       "id": "libraryScanDepth",
       "title": "游戏目录扫描层级",
       "default": 3,
@@ -71,12 +81,12 @@
       "id": "defaultLaunchMode",
       "title": "默认启动模式",
       "default": "Direct",
-      "description": "直接启动保持默认。可选优先启动翻译 EXE，或在缓存完成后使用已识别的 MTool 批处理模板。",
+      "description": "直接启动保持默认。翻译 EXE 优先可回退到缓存中的 MTool_Game.exe；MTool 启动优先先使用已识别的 MTool BAT 模板，没有模板时再回退到翻译模式。",
       "type": "select",
       "options": [
         { "label": "直接启动", "value": "Direct" },
         { "label": "翻译 EXE 优先", "value": "TranslationPreferred" },
-        { "label": "MTool 批处理优先", "value": "MTool" }
+        { "label": "MTool 启动优先", "value": "MTool" }
       ],
       "controlOptions": {
         "controlType": "select",
@@ -87,7 +97,7 @@
       "id": "mtoolExecutablePath",
       "title": "MTool 路径",
       "default": "",
-      "description": "MTool 批处理优先模式使用此安装目录内当前版本的 inject.exe、Loader DLL 和 nw.exe；不会修改 NAS 原文件或 MTool 私有游戏库。",
+      "description": "使用 MTool BAT 模板时调用此安装目录内的 inject.exe、Loader DLL 和 nw.exe；MTool_Game.exe 使用游戏自带的启动方式。不会修改 NAS 原文件或 MTool 私有游戏库。",
       "type": "file",
       "controlOptions": {
         "controlType": "fileinput",
@@ -284,6 +294,6 @@
   ],
   "scripts": {
     "build": "node --check index.js",
-    "test": "node --check index.js && node ../../tests/plugin-executable-detection.test.js && node ../../tests/plugin-log-retention.test.js"
+    "test": "node --check index.js && node ../../tests/plugin-executable-detection.test.js && node ../../tests/plugin-log-retention.test.js && node ../../tests/plugin-archive-discovery.test.js && node ../../tests/plugin-clear-takeover.test.js"
   }
 }

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.2.9-beta.1',
+    [string]$Version = '0.2.10-beta.1',
     [string]$Configuration = 'Release',
     [string]$DotNetPath = 'dotnet',
     [string]$NpmPath = 'npm.cmd'

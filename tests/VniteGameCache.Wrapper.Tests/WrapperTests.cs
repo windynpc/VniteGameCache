@@ -8,6 +8,84 @@ namespace VniteGameCache.Wrapper.Tests;
 public sealed class WrapperTests
 {
     [Fact]
+    public async Task Closing_game_job_stops_spawned_child_process()
+    {
+        Assert.True(OperatingSystem.IsWindows());
+
+        var childPidFile = Path.Combine(Path.GetTempPath(), $"vgc-job-child-{Guid.NewGuid():N}.txt");
+        var executable = PowerShellPath();
+        var startInfo = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-Command");
+        startInfo.ArgumentList.Add($"$child = Start-Process -FilePath '{executable}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath '{childPidFile}' -Value $child.Id; Start-Sleep -Seconds 30");
+
+        using var job = GameProcessJob.Create()!;
+        using var parent = Process.Start(startInfo)!;
+        job.Assign(parent);
+        try
+        {
+            Assert.True(await WaitForFileAsync(childPidFile));
+            var childId = int.Parse(await File.ReadAllTextAsync(childPidFile));
+            job.Dispose();
+            Assert.True(parent.WaitForExit(5000));
+            await Task.Delay(200);
+            Assert.False(IsAlive(childId));
+        }
+        finally
+        {
+            if (!parent.HasExited) parent.Kill(entireProcessTree: true);
+            File.Delete(childPidFile);
+        }
+    }
+
+    [Fact]
+    public async Task Process_monitor_waits_for_job_child_outside_expected_root()
+    {
+        Assert.True(OperatingSystem.IsWindows());
+        var executable = PowerShellPath();
+        var startInfo = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-Command");
+        startInfo.ArgumentList.Add($"Start-Sleep -Milliseconds 300; Start-Process -FilePath '{executable}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Milliseconds 900'; Start-Sleep -Milliseconds 200");
+
+        using var job = GameProcessJob.Create()!;
+        using var parent = Process.Start(startInfo)!;
+        job.Assign(parent);
+        var watch = Stopwatch.StartNew();
+
+        await new ProcessMonitor().WaitForExitTreeAsync(
+            parent, [], Path.GetTempPath(), DateTimeOffset.UtcNow,
+            TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(150),
+            CancellationToken.None, restrictDescendantsToExpectedRoot: true,
+            hasActiveJobProcesses: job.HasActiveProcesses);
+
+        watch.Stop();
+        Assert.True(watch.ElapsedMilliseconds >= 900);
+        Assert.False(job.HasActiveProcesses());
+    }
+
+    private static bool IsAlive(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    [Fact]
     public async Task Wrapper_returns_executable_not_found_for_missing_file()
     {
         var request = NewRequest(
@@ -375,11 +453,11 @@ public sealed class WrapperTests
     {
         var options = WrapperProgram.ParseArgs([
             "--game-id", "'57137a85-c50a-40d4-951e-d0fa9978be83'",
-            "--source-root", "\"G:\\Games\\Publisher\\Example Game\""
+            "--source-root", "\"G:\\Series Game\\ntrman\\The Rural Homecoming\""
         ]);
 
         Assert.Equal("57137a85-c50a-40d4-951e-d0fa9978be83", options.GameId);
-        Assert.Equal(@"G:\Games\Publisher\Example Game", options.SourceRoot);
+        Assert.Equal(@"G:\Series Game\ntrman\The Rural Homecoming", options.SourceRoot);
     }
 
     [Theory]
@@ -452,16 +530,10 @@ public sealed class WrapperTests
 
     private static string FindAgentDll()
     {
-        var colocatedAgent = Path.Combine(AppContext.BaseDirectory, "VniteGameCache.Agent.dll");
-        if (File.Exists(colocatedAgent))
-        {
-            return colocatedAgent;
-        }
-
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null)
         {
-            foreach (var configuration in new[] { "Debug", "Release" })
+            foreach (var configuration in new[] { "Release", "Debug" })
             {
                 var candidate = Path.Combine(
                     directory.FullName,
@@ -471,10 +543,7 @@ public sealed class WrapperTests
                     configuration,
                     "net8.0",
                     "VniteGameCache.Agent.dll");
-                if (File.Exists(candidate))
-                {
-                    return candidate;
-                }
+                if (File.Exists(candidate)) return candidate;
             }
 
             directory = directory.Parent;

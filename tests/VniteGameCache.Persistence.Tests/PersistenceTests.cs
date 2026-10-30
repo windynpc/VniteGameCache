@@ -31,6 +31,52 @@ public sealed class PersistenceTests
         AssertTableExists(connection, "operation_records");
         AssertTableExists(connection, "launch_sessions");
         AssertTableExists(connection, "migration_history");
+        AssertTableExists(connection, "archive_sources");
+    }
+
+    [Fact]
+    public void Archive_source_is_optional_and_removed_with_game()
+    {
+        var factory = InitializedFactory();
+        var games = new GameRepository(factory);
+        var archiveSources = new ArchiveSourceRepository(factory);
+        var game = SampleGame();
+        games.Create(game);
+        Assert.Null(archiveSources.GetByGameId(game.GameId));
+
+        var source = new ArchiveSourceRecord
+        {
+            GameId = game.GameId,
+            ArchivePath = @"\\FNAS\Games\中文 游戏.7z",
+            ExecutableRelativePath = "游戏/Game.exe",
+            ExpandedBytes = 4096,
+            FileCount = 2,
+            ArchiveSizeBytes = 1024,
+            ArchiveLastWriteUtc = DateTimeOffset.UtcNow
+        };
+        archiveSources.Upsert(source);
+        Assert.Equal(source.ExecutableRelativePath, archiveSources.GetByGameId(game.GameId)!.ExecutableRelativePath);
+        games.Delete(game.GameId);
+        Assert.Null(archiveSources.GetByGameId(game.GameId));
+    }
+
+    [Fact]
+    public void Schema_four_upgrade_adds_archive_table_without_changing_existing_game()
+    {
+        var factory = InitializedFactory();
+        var game = SampleGame();
+        new GameRepository(factory).Create(game);
+        using (var connection = factory.OpenConnection())
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "DROP TABLE archive_sources; DELETE FROM migration_history WHERE schema_version = 5;";
+            command.ExecuteNonQuery();
+        }
+
+        new MigrationRunner(factory).Initialize();
+
+        Assert.Equal(game.SourceRoot, new GameRepository(factory).GetById(game.GameId)!.SourceRoot);
+        Assert.Null(new ArchiveSourceRepository(factory).GetByGameId(game.GameId));
     }
 
     [Fact]
@@ -59,10 +105,10 @@ public sealed class PersistenceTests
         var games = new GameRepository(factory);
         var game = SampleGame() with
         {
-            SourceRoot = @"\\NAS-SERVER\Games\中文 空格\源",
+            SourceRoot = @"\\FNAS\Game\中文 空格\源",
             CacheRoot = @"D:\Cache Root\中文",
-            ExecutablePath = @"\\NAS-SERVER\Games\中文 空格\Game.exe",
-            WorkingDirectory = @"\\NAS-SERVER\Games\中文 空格",
+            ExecutablePath = @"\\FNAS\Game\中文 空格\Game.exe",
+            WorkingDirectory = @"\\FNAS\Game\中文 空格",
             VniteGameId = "vnite-1"
         };
 
@@ -415,10 +461,10 @@ public sealed class PersistenceTests
     {
         GameId = gameId,
         DisplayName = $"Game {gameId}",
-        SourceRoot = @"\\NAS-SERVER\Games\Source 中文",
+        SourceRoot = @"\\FNAS\Game\Source 中文",
         CacheRoot = @"D:\Cache Root",
-        ExecutablePath = @"\\NAS-SERVER\Games\Source 中文\Game.exe",
-        WorkingDirectory = @"\\NAS-SERVER\Games\Source 中文",
+        ExecutablePath = @"\\FNAS\Game\Source 中文\Game.exe",
+        WorkingDirectory = @"\\FNAS\Game\Source 中文",
         ArgumentsJson = "[\"--flag\",\"值\"]"
     };
 

@@ -1,10 +1,28 @@
 using VniteGameCache.LibraryImport;
+using VniteGameCache.Contracts;
 using VniteGameCache.Persistence;
 
 namespace VniteGameCache.LibraryImport.Tests;
 
 public sealed class LibraryImportTests
 {
+    [Fact]
+    public void Archive_preview_lists_executable_without_extracting_and_rejects_traversal()
+    {
+        const string safe = "----------\nPath = 游戏/Game.exe\nFolder = -\nSize = 4096\nEncrypted = -\n\n";
+        var preview = ArchivePreview.ParseListing("game.7z", safe);
+        Assert.True(preview.Supported);
+        Assert.Equal(4096, preview.ExpandedBytes);
+        Assert.Equal("游戏/Game.exe", Assert.Single(preview.ExecutableCandidates));
+
+        const string unsafeListing = "----------\nPath = ../outside.exe\nFolder = -\nSize = 1\nEncrypted = -\n\n";
+        Assert.False(ArchivePreview.ParseListing("game.zip", unsafeListing).Supported);
+        const string reserved = "----------\nPath = CON.exe\nFolder = -\nSize = 1\nEncrypted = -\n\n";
+        Assert.False(ArchivePreview.ParseListing("game.zip", reserved).Supported);
+        const string linked = "----------\nPath = Game.exe\nFolder = -\nSize = 1\nSymbolic Link = ../outside.exe\n\n";
+        Assert.False(ArchivePreview.ParseListing("game.7z", linked).Supported);
+    }
+
     [Fact]
     public void Discovery_respects_scan_depth_one_when_configured()
     {
@@ -72,6 +90,9 @@ public sealed class LibraryImportTests
         var result = fixture.Import.Import(fixture.Config, dryRun.Candidates);
 
         var imported = Assert.Single(result.ImportedGames);
+        Assert.True(Guid.TryParse(imported.GameId, out _));
+        Assert.Equal(imported.GameId, CandidateIds.GameIdFromSourceRoot(imported.SourceRoot));
+        Assert.Equal(imported.GameId, LaunchArgumentCodec.Parse(LaunchArgumentCodec.Build(imported.GameId)).GameId);
         var game = fixture.Games.GetById(imported.GameId)!;
         Assert.Equal(imported.SourceRoot, game.SourceRoot);
         Assert.Equal(imported.CacheRoot, game.CacheRoot);

@@ -1,5 +1,9 @@
 # Data Model
 
+## Planned archive source extension (schema v5)
+
+`games` keeps its current directory-source fields and behavior. An optional `archive_sources` row identifies an archive-backed game by `game_id` and stores `archive_path`, `executable_relative_path`, `expanded_bytes`, `file_count`, source file size and last-write time. The row is absent for existing directory games. Archive entries never populate directory-source `file_entries` before extraction. The Agent must branch on this row before directory indexing or Robocopy. A Ready archive cache remains launchable when the NAS archive is temporarily unavailable; a changed archive requires a new single-game staged extraction. This extension requires a forward migration and must not rewrite existing game rows.
+
 Phase 4 data model is SQLite schema v1 plus the generated Game Manifest v1.
 
 Phase 5 reuses SQLite schema v1. No database migration is added.

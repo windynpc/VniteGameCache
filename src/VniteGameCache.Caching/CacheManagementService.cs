@@ -328,10 +328,16 @@ public sealed class CacheManagementService(
     }
 
     public Task<CacheResult> QuickRefreshAsync(string gameId, CancellationToken cancellationToken = default) =>
-        cacheService.PrepareCacheAsync(new CacheRequest(Guid.NewGuid(), gameId, ForceRefresh: true), cancellationToken);
+        new ArchiveSourceRepository(factory).GetByGameId(gameId) is not null
+            ? Task.FromResult(new CacheResult(CacheResultStatus.VerificationFailed, gameId, false,
+                "archive_refresh_requires_review", "Archive cache refresh requires a separate reviewed extraction.",
+                null, null, null, null))
+            : cacheService.PrepareCacheAsync(new CacheRequest(Guid.NewGuid(), gameId, ForceRefresh: true), cancellationToken);
 
     public async Task<CacheClearResult> CleanRebuildAsync(string gameId, CancellationToken cancellationToken = default)
     {
+        if (new ArchiveSourceRepository(factory).GetByGameId(gameId) is not null)
+            return new CacheClearResult("archive_rebuild_requires_review", gameId, false, false, [], null);
         var clear = ClearCache(new CacheClearRequest(gameId, Force: false, Reason: "clean_rebuild"));
         if (!clear.Cleared)
         {
@@ -358,7 +364,12 @@ public sealed class CacheManagementService(
             return new CacheClearResult("cache_in_use", game.GameId, false, false, [], null);
         }
 
-        var detected = DetectUserData(game.CacheRoot, protectConfigFiles);
+        var detected = DetectUserData(game.CacheRoot, protectConfigFiles).ToList();
+        if (new ArchiveSourceRepository(factory).GetByGameId(game.GameId) is not null &&
+            IsSubPathOf(game.WorkingDirectory, game.CacheRoot))
+        {
+            detected.AddRange(DetectUserData(game.WorkingDirectory, protectConfigFiles));
+        }
         var hasPossibleSaveData = game.ContainsPossibleSaveData || game.PendingManualSaveBackup || detected.Count > 0 ||
                                   new SaveProfileRepository(factory).ListByGame(game.GameId).Any(profile => profile.IsEnabled);
         if (hasPossibleSaveData && !request.BackupSaves && !request.KeepUserData && !request.Force)

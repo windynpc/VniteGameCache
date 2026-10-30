@@ -334,8 +334,12 @@ public static class WrapperRunner
                 launchPlan.Mode.ToString(),
                 launchPlan.Message);
 
-            var process = StartGameProcess(request, launchPlan, executablePath, workingDirectory, request.ExecutablePath, request.WorkingDirectory);
+            using var processJob = GameProcessJob.Create();
+            var process = StartGameProcess(request, launchPlan, executablePath, workingDirectory, request.ExecutablePath, request.WorkingDirectory, processJob);
             var processId = process.Id;
+            await log.WriteAsync(request, "wrapper", "game_process_job_attached", processId, launchPlan.TrackedExecutablePath,
+                processJob is { AssignedProcessCount: > 0 } ? "attached" : "unavailable",
+                processJob is null ? "Non-Windows platform" : $"Assigned processes: {processJob.AssignedProcessCount}");
             await log.WriteAsync(request, "wrapper", "game_started", processId, launchPlan.TrackedExecutablePath, "started", launchPlan.Message);
             await agentClient.UpdateRuntimeStateAsync(request, "Running", processId, cancellationToken);
             IReadOnlyList<int> observedProcessIds;
@@ -351,7 +355,8 @@ public static class WrapperRunner
                     TimeSpan.FromSeconds(2),
                     cancellationToken,
                     launchPlan.RestrictDescendantsToExpectedRoot,
-                    launchPlan.AdditionalTrackingRoots);
+                    launchPlan.AdditionalTrackingRoots,
+                    processJob is { AssignedProcessCount: > 0 } ? processJob.HasActiveProcesses : null);
             }
             finally
             {
@@ -359,7 +364,7 @@ public static class WrapperRunner
                 await agentClient.UpdateRuntimeStateAsync(request, "Ready", processId, CancellationToken.None);
             }
 
-            if (launchPlan.Mode == VgcLaunchMode.MTool && observedProcessIds.All(id => id == processId))
+            if (launchPlan.Mode == VgcLaunchMode.MTool && launchPlan.SecondaryProcesses.Count > 0 && observedProcessIds.All(id => id == processId))
             {
                 await log.WriteAsync(request, "wrapper", "mtool_game_process_not_observed", processId, launchPlan.TrackedExecutablePath, "failed", null);
                 return Failure(
@@ -405,12 +410,15 @@ public static class WrapperRunner
         string cacheExecutablePath,
         string cacheWorkingDirectory,
         string sourceExecutablePath,
-        string sourceWorkingDirectory)
+        string sourceWorkingDirectory,
+        GameProcessJob? processJob)
     {
         var originalScript = TryReadOriginalScript(request.Arguments);
         if (launchPlan.UseOriginalScript && originalScript is { Count: > 0 })
         {
-            return StartOriginalScript(originalScript, cacheExecutablePath, cacheWorkingDirectory, sourceExecutablePath, sourceWorkingDirectory);
+            var scriptProcess = StartOriginalScript(originalScript, cacheExecutablePath, cacheWorkingDirectory, sourceExecutablePath, sourceWorkingDirectory);
+            AssignToJobOrStop(scriptProcess, processJob);
+            return scriptProcess;
         }
 
         var primaryArguments = launchPlan.UseRequestArguments
@@ -418,13 +426,31 @@ public static class WrapperRunner
             : launchPlan.PrimaryProcess.Arguments;
         var startInfo = CreateStartInfo(launchPlan.PrimaryProcess, primaryArguments, request.Environment);
         var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Process.Start returned null");
+        AssignToJobOrStop(process, processJob);
         foreach (var secondaryProcess in launchPlan.SecondaryProcesses)
         {
             using var secondary = Process.Start(CreateStartInfo(secondaryProcess, secondaryProcess.Arguments, request.Environment))
                                   ?? throw new InvalidOperationException($"Process.Start returned null for {secondaryProcess.FileName}");
+            AssignToJobOrStop(secondary, processJob);
         }
 
         return process;
+    }
+
+    private static void AssignToJobOrStop(Process process, GameProcessJob? processJob)
+    {
+        if (processJob is null || process.HasExited) return;
+        try
+        {
+            processJob.Assign(process);
+        }
+        catch
+        {
+            if (process.HasExited) return;
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            process.Dispose();
+            throw;
+        }
     }
 
     private static ProcessStartInfo CreateStartInfo(

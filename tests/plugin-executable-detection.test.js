@@ -149,13 +149,13 @@ assert.strictEqual(__test.parseLaunchArguments(`--game-id=${canonicalGameId}`).g
 assert.strictEqual(__test.parseLaunchArguments(`--game-id "${canonicalGameId}"`).game_id, canonicalGameId)
 assert.strictEqual(__test.parseLaunchArguments(`--game-id '${canonicalGameId}'`).game_id, canonicalGameId)
 assert.strictEqual(__test.parseLaunchArguments(`"--game-id" "${canonicalGameId}"`).game_id, canonicalGameId)
-assert.strictEqual(__test.parseLaunchArguments(`"E:\\VGC\\dist\\current\\bin\\VniteGameCache.Wrapper.dll" --game-id=${canonicalGameId}`).game_id, canonicalGameId)
+assert.strictEqual(__test.parseLaunchArguments(`"E:\\VniteGameCache_Project\\dist\\current\\bin\\VniteGameCache.Wrapper.dll" --game-id=${canonicalGameId}`).game_id, canonicalGameId)
 const expectedLocal = {
   path: { gamePath: 'C:\\VGC\\launchers\\Game [GameId-12345678] 12345678-1234-1234-1234-123456789abc - Vnite缓存启动.lnk' },
   launcher: {
     mode: 'file',
     fileConfig: { path: 'C:\\VGC\\launchers\\Game [GameId-12345678] 12345678-1234-1234-1234-123456789abc - Vnite缓存启动.lnk', monitorPath: 'VniteGameCache.Wrapper' },
-    scriptConfig: { workingDirectory: 'E:\\VGC\\dist\\current\\bin' }
+    scriptConfig: { workingDirectory: 'E:\\VniteGameCache_Project\\dist\\current\\bin' }
   },
   utils: { rootPath: 'G:\\Game\\Demo', markPath: 'G:\\Game\\Demo' }
 }

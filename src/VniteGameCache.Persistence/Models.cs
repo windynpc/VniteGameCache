@@ -2,7 +2,7 @@ namespace VniteGameCache.Persistence;
 
 public static class Schema
 {
-    public const int CurrentVersion = 4;
+    public const int CurrentVersion = 5;
 }
 
 public enum LaunchPolicy { FastLaunch, StrictLaunch, OfflineLaunch }
@@ -82,6 +82,17 @@ public sealed record GameRecord
     public CacheStatus CacheStatus { get; init; } = CacheStatus.NotCached;
     public DateTimeOffset CreatedUtc { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedUtc { get; init; } = DateTimeOffset.UtcNow;
+}
+
+public sealed record ArchiveSourceRecord
+{
+    public required string GameId { get; init; }
+    public required string ArchivePath { get; init; }
+    public required string ExecutableRelativePath { get; init; }
+    public long ExpandedBytes { get; init; }
+    public int FileCount { get; init; }
+    public long ArchiveSizeBytes { get; init; }
+    public DateTimeOffset ArchiveLastWriteUtc { get; init; }
 }
 
 public sealed record TombstoneRecord

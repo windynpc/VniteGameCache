@@ -6,75 +6,59 @@ namespace VniteGameCache.Agent.Tests;
 public sealed class ProtocolTests
 {
     [Fact]
-    public async Task Cache_lru_suggest_preserves_expired_quarantine_files_and_records()
+    public async Task Game_delete_preserves_active_quarantine_index()
     {
         var root = Path.Combine(Path.GetTempPath(), "vgc-agent-tests", Guid.NewGuid().ToString("N"));
-        var quarantinePath = Path.Combine(root, "Quarantine", "old");
-        Directory.CreateDirectory(quarantinePath);
-        var savePath = Path.Combine(quarantinePath, "save.sav");
-        File.WriteAllText(savePath, "save");
+        Directory.CreateDirectory(root);
         var databasePath = Path.Combine(root, "index.db");
         var factory = new SqliteConnectionFactory(new DatabaseOptions(databasePath));
         new MigrationRunner(factory).Initialize();
-        new GameRepository(factory).Create(new GameRecord
+        var games = new GameRepository(factory);
+        games.Create(new GameRecord
         {
-            GameId = "game-1",
-            DisplayName = "Game",
+            GameId = "quarantine-test",
+            DisplayName = "Quarantine Test",
             SourceRoot = Path.Combine(root, "source"),
             CacheRoot = Path.Combine(root, "cache"),
-            ExecutablePath = "Game.exe",
-            WorkingDirectory = Path.Combine(root, "cache"),
-            CreatedUtc = DateTimeOffset.UtcNow,
-            UpdatedUtc = DateTimeOffset.UtcNow
+            ExecutablePath = Path.Combine(root, "source", "Game.exe"),
+            ArgumentsJson = "[]",
+            WorkingDirectory = Path.Combine(root, "source")
         });
         var quarantine = new QuarantineRepository(factory);
-        var entry = new QuarantineEntryRecord
+        quarantine.Create(new QuarantineEntryRecord
         {
-            QuarantineId = "q-old",
-            GameId = "game-1",
+            QuarantineId = "quarantine-test-entry",
+            GameId = "quarantine-test",
             OriginalCacheRoot = Path.Combine(root, "cache"),
-            QuarantinePath = quarantinePath,
-            Reason = "manual_clear",
-            CreatedUtc = DateTimeOffset.UtcNow.AddDays(-31),
-            SizeBytes = 4,
-            FileCount = 1,
-            ContainsPossibleSaveData = true
-        };
-        quarantine.Create(entry);
-        // A missing directory must not make a suggestion discard its recovery record.
-        quarantine.Create(entry with
-        {
-            QuarantineId = "q-missing",
-            QuarantinePath = Path.Combine(root, "Quarantine", "missing")
+            QuarantinePath = Path.Combine(root, "Quarantine", "quarantine-test"),
+            Reason = "test"
         });
-        var settingsPath = Path.Combine(root, "settings.json");
-        File.WriteAllText(settingsPath, "{\"schema_version\":1}");
-        var originalSettingsPath = Environment.GetEnvironmentVariable("VGC_SETTINGS_PATH");
+
         var originalOut = Console.Out;
-        Environment.SetEnvironmentVariable("VGC_SETTINGS_PATH", settingsPath);
         try
         {
             using var output = new StringWriter();
             Console.SetOut(output);
-            var exitCode = await Agent.AgentProgram.MainAsync([
-                "cache-lru-suggest", "--db-path", databasePath,
-                "--quarantine-retention-days", "30"
-            ]);
+            var blocked = await Agent.AgentProgram.MainAsync(["game-delete", "--db-path", databasePath, "--game-id", "quarantine-test"]);
+            Assert.Equal(2, blocked);
+            Assert.NotNull(games.GetById("quarantine-test"));
+            Assert.NotNull(quarantine.GetById("quarantine-test-entry"));
 
-            Assert.Equal(0, exitCode);
-            using var result = System.Text.Json.JsonDocument.Parse(output.ToString());
-            Assert.False(result.RootElement.GetProperty("auto_apply").GetBoolean());
-            Assert.Equal("save", File.ReadAllText(savePath));
-            Assert.NotNull(quarantine.GetById("q-old"));
-
-            Assert.NotNull(quarantine.GetById("q-missing"));
+            quarantine.MarkRestored("quarantine-test-entry", DateTimeOffset.UtcNow);
+            var deleted = await Agent.AgentProgram.MainAsync(["game-delete", "--db-path", databasePath, "--game-id", "quarantine-test"]);
+            Assert.Equal(0, deleted);
+            Assert.Null(games.GetById("quarantine-test"));
         }
         finally
         {
             Console.SetOut(originalOut);
-            Environment.SetEnvironmentVariable("VGC_SETTINGS_PATH", originalSettingsPath);
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            Directory.Delete(root, recursive: true);
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
         }
     }
 

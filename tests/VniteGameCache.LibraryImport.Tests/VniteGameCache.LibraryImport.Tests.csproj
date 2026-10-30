@@ -21,6 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\VniteGameCache.Contracts\VniteGameCache.Contracts.csproj" />
     <ProjectReference Include="..\..\src\VniteGameCache.LibraryImport\VniteGameCache.LibraryImport.csproj" />
     <ProjectReference Include="..\..\src\VniteGameCache.Persistence\VniteGameCache.Persistence.csproj" />
     <ProjectReference Include="..\..\src\VniteGameCache.Indexing\VniteGameCache.Indexing.csproj" />

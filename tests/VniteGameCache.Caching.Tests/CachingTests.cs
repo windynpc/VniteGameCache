@@ -170,6 +170,8 @@ public sealed class CachingTests
         var result = await fixture.Cache.PrepareCacheAsync(new CacheRequest(Guid.NewGuid(), "game-1"));
 
         Assert.Equal(CacheResultStatus.RobocopyFailed, result.Status);
+        Assert.Contains("exit code 8", result.ErrorMessage);
+        Assert.Contains(".robocopy.log", result.ErrorMessage);
         var game = fixture.Games.GetById("game-1")!;
         Assert.Equal(0, game.CacheRevision);
         Assert.Equal(CacheStatus.Failed, game.CacheStatus);
@@ -311,6 +313,55 @@ public sealed class CachingTests
         var restored = fixture.Management.RestoreQuarantine(cleared.QuarantineEntry!.QuarantineId);
         Assert.Equal(fixture.CacheRoot, restored.RestoredPath);
         Assert.True(File.Exists(Path.Combine(fixture.CacheRoot, "save", "slot1.sav")));
+    }
+
+    [Fact]
+    public void Restore_quarantine_refuses_nonempty_target_without_losing_either_copy()
+    {
+        using var fixture = TestFixture.Create();
+        fixture.CreateSource("Game.exe");
+        fixture.CreateGameAndIndex();
+        Directory.CreateDirectory(fixture.CacheRoot);
+        File.WriteAllText(Path.Combine(fixture.CacheRoot, "old-save.sav"), "old");
+        var cleared = fixture.Management.ClearCache(new CacheClearRequest("game-1", Force: true));
+        var entry = Assert.IsType<QuarantineEntryRecord>(cleared.QuarantineEntry);
+        Directory.CreateDirectory(fixture.CacheRoot);
+        File.WriteAllText(Path.Combine(fixture.CacheRoot, "new-save.sav"), "new");
+
+        Assert.Throws<CacheException>(() => fixture.Management.RestoreQuarantine(entry.QuarantineId));
+        Assert.Equal("new", File.ReadAllText(Path.Combine(fixture.CacheRoot, "new-save.sav")));
+        Assert.Equal("old", File.ReadAllText(Path.Combine(entry.QuarantinePath, "old-save.sav")));
+        Assert.Null(new QuarantineRepository(fixture.Factory).GetById(entry.QuarantineId)!.RestoredUtc);
+    }
+
+    [Fact]
+    public void Safe_clear_blocks_nested_save_data_in_archive_cache()
+    {
+        using var fixture = TestFixture.Create();
+        fixture.CreateGameOnly();
+        var workingDirectory = Path.Combine(fixture.CacheRoot, "archive folder");
+        var saveDirectory = Path.Combine(workingDirectory, "save");
+        Directory.CreateDirectory(saveDirectory);
+        File.WriteAllText(Path.Combine(saveDirectory, "slot1.sav"), "save");
+        fixture.Games.Update(fixture.Games.GetById("game-1")! with
+        {
+            ExecutablePath = Path.Combine(workingDirectory, "Game.exe"),
+            WorkingDirectory = workingDirectory
+        });
+        new ArchiveSourceRepository(fixture.Factory).Upsert(new ArchiveSourceRecord
+        {
+            GameId = "game-1",
+            ArchivePath = Path.Combine(fixture.SourceRoot, "game.zip"),
+            ExecutableRelativePath = "archive folder/Game.exe",
+            FileCount = 1
+        });
+
+        var result = fixture.Management.ClearCache(new CacheClearRequest("game-1"));
+
+        Assert.Equal("blocked_possible_save_data", result.Status);
+        Assert.False(result.Cleared);
+        Assert.Contains(saveDirectory, result.DetectedUserDataPaths);
+        Assert.True(File.Exists(Path.Combine(saveDirectory, "slot1.sav")));
     }
 
     [Fact]

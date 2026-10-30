@@ -69,6 +69,10 @@ Windows Cache Agent
 
 ### Phase 5.5 Library Import
 
+### Archive source extension (planned)
+
+Archive intake is a separate source type from directory intake. VGC can preview ZIP, 7z, and RAR candidates without unpacking them, then ask the user to confirm the title and executable. A confirmed archive is registered through the existing Vnite GameDB and Wrapper launcher chain; the game body is extracted by the Agent to the configured E: cache only when requested or pre-cached. Directory indexing and Robocopy must never receive an archive file as `source_root`. Optional automatic discovery enumerates only the configured library root's first-level archive files and imports only unambiguous candidates through this same chain; other candidates remain for manual confirmation.
+
 Phase 5.5 adds a library import layer before indexing and caching:
 
 ```text
@@ -92,7 +96,7 @@ Rules:
 - Agent remains an internal helper; users should not manually run Agent CLI.
 - Vnite Plugin stores configuration and calls Agent.
 - Full indexing and cache copy happen only for imported/selected/launched games.
-- MTool has no verified target-game CLI. Optional MTool mode therefore recognizes only MTool-generated BAT structure after caching and rebuilds that verified launch template with the currently configured MTool components; Direct remains the default.
+- MTool has no verified target-game CLI. Optional MTool mode recognizes MTool-generated BAT structure after caching and rebuilds that verified launch template with the currently configured MTool components. When no recognized BAT exists, it falls back to TranslationPreferred, which can select a cached `MTool_Game.exe`. Direct remains the default.
 
 Vnite API note:
 
@@ -102,7 +106,7 @@ Vnite API note:
 - Existence checks must use `getAllGames()[gameId]`; `getGame(gameId)` creates an empty document when missing.
 - Existing `gameDoc` metadata is preserved; allowed local launcher/path fields may be updated.
 - `pending_manifest` remains only a fallback when required real GameDB methods are unavailable.
-- Arbitrary MTool command-line guessing remains unsupported. The supported MTool path is limited to recognized generated BAT templates and never writes MTool `gameLib`.
+- Arbitrary MTool command-line guessing remains unsupported. The supported MTool path is limited to a cached game-local `MTool_Game.exe` or recognized generated BAT template and never writes MTool `gameLib`.
 
 ### IPC
 
@@ -164,7 +168,7 @@ The plugin still does not perform heavy file work. All cache and save file opera
 
 Newly imported or migrated plugin-managed games use Vnite `launcher.mode=file` pointing at a generated `.lnk`. The shortcut target is Wrapper with `--game-id`, so Vnite does not use script mode and does not open `cmd.exe`.
 
-When adopting existing Vnite entries, the plugin treats configured adopt roots as safety boundaries, not as metadata sources. It expands Windows mapped-drive aliases exposed by `Get-PSDrive` so a configured UNC root such as `\\NAS-SERVER\Games` can match Vnite paths stored as `G:\...`. A root that starts with a single slash, such as `\Category`, is expanded against known mapped or configured drive prefixes before matching.
+When adopting existing Vnite entries, the plugin treats configured adopt roots as safety boundaries, not as metadata sources. It expands Windows mapped-drive aliases exposed by `Get-PSDrive` so a configured UNC root such as `\\FNAS\Game` can match Vnite paths stored as `G:\...`. A root that starts with a single slash, such as `\Gal SLG Game`, is expanded against known mapped or configured drive prefixes before matching.
 
 ## Shared Runtime Settings
 
@@ -207,7 +211,8 @@ Direct
   -> use the persisted game executable
 
 TranslationPreferred
-  -> prefer a translated EXE beside the persisted executable
+  -> prefer a translated EXE beside the persisted executable; zh and cn are separate case-insensitive filename markers
+  -> otherwise use MTool_Game.exe beside the persisted executable, if present
   -> otherwise use the persisted executable
 
 MTool
@@ -216,4 +221,4 @@ MTool
   -> if no MTool BAT exists, try TranslationPreferred
 ```
 
-The resolver never edits the NAS game directory or MTool `gameLib`. MTool BAT files are treated as templates only; stale absolute game paths and stale MTool installation paths are not executed directly. If a BAT is present but cannot be safely parsed or the configured MTool components are incomplete, launch stops with an actionable error instead of silently running the original untranslated game.
+The resolver never edits the NAS game directory or MTool `gameLib`. MTool_Game.exe is a game-local launcher and may use its bundled MTool components rather than the currently configured MTool installation. MTool BAT files are treated as templates only; stale absolute game paths and stale MTool installation paths are not executed directly. If a BAT is present but cannot be safely parsed or the configured MTool components are incomplete, launch stops with an actionable error instead of silently running the original untranslated game.

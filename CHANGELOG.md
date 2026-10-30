@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.10-beta.1
+
+- Add opt-in ZIP/7z/RAR archive discovery, preview and per-game import, with on-demand extraction to the SSD cache.
+- Add per-game archive source, cache and quarantine status to the Control Panel, plus an on-demand actual disk usage scan.
+- Add safer single-game cleanup, quarantine restoration and clearer takeover command results.
+- Improve MTool and translated executable detection, launch selection, and Wrapper process supervision.
+- Keep archive updates from silently replacing nonempty caches and protect detected save data.
+
+See `docs/releases/0.2.10-beta.1.md` for verification and remaining acceptance limits.
+
 ## 0.2.9-beta.1
 
 - Limit combined VGC logs to 500 MB, reclaiming the oldest logs first.

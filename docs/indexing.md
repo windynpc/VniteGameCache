@@ -1,5 +1,7 @@
 # Persistent Indexing
 
+Archive source preview may read only the archive directory and entry table to identify executable candidates and estimated expanded size. It must not recursively unpack every archive during library scan. Archive content indexing, if needed for cache verification, occurs per selected game during cache preparation. Directory-source manifests remain unchanged until an explicit archive schema is implemented.
+
 ## 原则
 
 索引系统是本项目的核心。

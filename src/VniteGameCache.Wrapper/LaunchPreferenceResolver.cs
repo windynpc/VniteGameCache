@@ -48,7 +48,7 @@ public sealed class LaunchPreferenceResolver(IMToolJunctionManager? junctionMana
         "setup", "install", "uninstall", "unins", "update", "updater", "config", "crash", "helper", "notification", "vcredist", "dxsetup"
     ];
     private static readonly Regex HumanTranslationMarker = new(
-        @"(?:^|[_\-.\s()\[\]])(?:cn|chs|sc|zh[_\-]?cn)(?=$|[_\-.\s()\[\]])",
+        @"(?:^|[_\-.\s()\[\]])(?:chs|cn|sc|zh)(?=$|[_\-.\s()\[\]])",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly Regex AiTranslationMarker = new(
         @"(?:^|[_\-.\s()\[\]])ai(?=$|[_\-.\s()\[\]])",
@@ -114,7 +114,8 @@ public sealed class LaunchPreferenceResolver(IMToolJunctionManager? junctionMana
             .ThenBy(candidate => candidate.Path, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
 
-        return candidates?.Path ?? executablePath;
+        var mtoolGameExecutable = Path.Combine(directory, "MTool_Game.exe");
+        return candidates?.Path ?? (File.Exists(mtoolGameExecutable) ? mtoolGameExecutable : executablePath);
     }
 
     public MToolBatchTemplate? FindMToolTemplate(string cacheWorkingDirectory)
@@ -170,16 +171,17 @@ public sealed class LaunchPreferenceResolver(IMToolJunctionManager? junctionMana
             return Direct(executablePath, workingDirectory, $"{prefix}未找到与当前主程序配对的翻译 EXE，使用原缓存可执行文件。".Trim());
         }
 
+        var usesMToolGame = Path.GetFileName(translatedPath).Equals("MTool_Game.exe", StringComparison.OrdinalIgnoreCase);
         return new ResolvedLaunchPlan(
             VgcLaunchMode.TranslationPreferred,
             new LaunchProcessSpec(translatedPath, Path.GetDirectoryName(translatedPath) ?? workingDirectory, Array.Empty<string>()),
             Array.Empty<LaunchProcessSpec>(),
             translatedPath,
-            UseRequestArguments: true,
+            UseRequestArguments: !usesMToolGame,
             UseOriginalScript: false,
             RestrictDescendantsToExpectedRoot: false,
             AdditionalTrackingRoots: Array.Empty<string>(),
-            $"{prefix}翻译 EXE 优先：{Path.GetFileName(translatedPath)}".Trim());
+            $"{prefix}{(usesMToolGame ? "翻译 EXE 回退：游戏自带 MTool_Game.exe" : $"翻译 EXE 优先：{Path.GetFileName(translatedPath)}")}".Trim());
     }
 
     private ResolvedLaunchPlan ResolveMTool(
@@ -315,7 +317,7 @@ public sealed class LaunchPreferenceResolver(IMToolJunctionManager? junctionMana
                || stem.Contains("简体", StringComparison.OrdinalIgnoreCase)
                || stem.Contains("汉化", StringComparison.OrdinalIgnoreCase)
                || HumanTranslationMarker.IsMatch(stem)
-               || Regex.IsMatch(stem, "(?:CN|CHS|SC)$", RegexOptions.CultureInvariant);
+               || Regex.IsMatch(stem, "(?:CHS|CN|SC|ZH)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 
     private static bool HasAiTranslationMarker(string stem)
@@ -353,7 +355,7 @@ public sealed class LaunchPreferenceResolver(IMToolJunctionManager? junctionMana
             value = Regex.Replace(value, Regex.Escape(marker), " ", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         }
 
-        value = Regex.Replace(value, "(?:CN|CHS|SC|AI)$", "", RegexOptions.CultureInvariant);
+        value = Regex.Replace(value, "(?:CHS|CN|SC|ZH|AI)$", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         return value;
     }
 

@@ -1,4 +1,3 @@
-using VniteGameCache.Contracts;
 using VniteGameCache.Persistence;
 using System.Text.Json;
 
@@ -17,7 +16,6 @@ public sealed class CacheService(
         var taskId = $"prepare-cache-{request.RequestId:N}";
         GameRecord? game = null;
         CopyPlan? plan = null;
-        string? logDirectory = null;
 
         try
         {
@@ -72,7 +70,6 @@ public sealed class CacheService(
             cancellationToken.ThrowIfCancellationRequested();
             store.MarkCopying(taskId);
             var command = commandBuilder.Build(plan);
-            logDirectory = Path.GetDirectoryName(command.LogPath);
             var existingProgress = CalculateExistingProgress(plan, files);
             store.UpdateTaskProgress(taskId, existingProgress.Bytes, plan.EstimatedTotalBytes);
             var latestProgress = new CacheProgress(
@@ -141,10 +138,16 @@ public sealed class CacheService(
                     // Keep the original robocopy failure when the cache is not actually launch-ready.
                 }
 
+                var failureMessage = $"Robocopy failed with exit code {robocopy.ExitCode}. Log: {command.LogPath}";
+                if (!string.IsNullOrWhiteSpace(latestProgress.CurrentFile))
+                {
+                    failureMessage += $" Last observed file: {latestProgress.CurrentFile}";
+                }
+
                 store.MarkCacheFailed(game.GameId);
-                store.MarkTask(taskId, TaskState.Failed, "robocopy_failed", $"Robocopy failed with exit code {robocopy.ExitCode}.");
+                store.MarkTask(taskId, TaskState.Failed, "robocopy_failed", failureMessage);
                 WriteProgressSnapshot(command, latestProgress with { Phase = "Failed", RobocopyExitCode = robocopy.ExitCode, UpdatedUtc = DateTimeOffset.UtcNow });
-                return Failure(CacheResultStatus.RobocopyFailed, game.GameId, "robocopy_failed", $"Robocopy failed with exit code {robocopy.ExitCode}.", plan, true, robocopy.ExitCode);
+                return Failure(CacheResultStatus.RobocopyFailed, game.GameId, "robocopy_failed", failureMessage, plan, true, robocopy.ExitCode);
             }
 
             store.MarkTask(taskId, TaskState.Verifying);
@@ -196,10 +199,6 @@ public sealed class CacheService(
         {
             if (game is not null) store.MarkTask(taskId, TaskState.Failed, "unexpected_error", error.Message);
             return Failure(CacheResultStatus.UnexpectedError, game?.GameId ?? request.GameId, "unexpected_error", error.Message, plan, false, null);
-        }
-        finally
-        {
-            if (logDirectory is not null) LogRetention.Trim(LogRetention.Roots(logDirectory));
         }
     }
 

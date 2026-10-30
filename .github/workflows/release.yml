@@ -39,9 +39,14 @@ jobs:
             'release', 'create', '${{ github.ref_name }}',
             "release/VniteGameCache-v$version-win-x64.zip",
             "release/VniteGameCache-v$version-win-x64.zip.sha256",
-            '--generate-notes',
             '--title', "Vnite Game Cache $version"
           )
+          $notesPath = "docs/releases/$version.md"
+          if (Test-Path -LiteralPath $notesPath) {
+            $arguments += @('--notes-file', $notesPath)
+          } else {
+            $arguments += '--generate-notes'
+          }
           if ($version.Contains('-')) {
             $arguments += '--prerelease'
           }

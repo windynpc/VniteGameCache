@@ -37,6 +37,35 @@ public sealed class LaunchPreferenceResolverTests
         Assert.False(plan.UseOriginalScript);
     }
 
+    [Theory]
+    [InlineData("Game zh.exe")]
+    [InlineData("Game ZH.exe")]
+    [InlineData("Game cn.exe")]
+    [InlineData("Game CN.exe")]
+    [InlineData("Gamezh.exe")]
+    [InlineData("GameCN.exe")]
+    public void Translation_mode_accepts_separate_zh_and_cn_markers_regardless_of_case(string translatedName)
+    {
+        using var fixture = new LaunchFixture();
+        var gameExecutable = fixture.CreateGameFile("Game.exe");
+        var translatedExecutable = fixture.CreateGameFile(translatedName);
+
+        var selected = fixture.Resolver.SelectPreferredTranslationExecutable(gameExecutable);
+
+        Assert.Equal(translatedExecutable, selected);
+    }
+
+    [Fact]
+    public void Translation_mode_does_not_match_zh_or_cn_inside_an_unrelated_word()
+    {
+        using var fixture = new LaunchFixture();
+        var gameExecutable = fixture.CreateGameFile("Game.exe");
+        fixture.CreateGameFile("GameZhong.exe");
+        fixture.CreateGameFile("Game_CNHack.exe");
+
+        Assert.Equal(gameExecutable, fixture.Resolver.SelectPreferredTranslationExecutable(gameExecutable));
+    }
+
     [Fact]
     public void Translation_mode_prefers_paired_ai_model_executable()
     {
@@ -105,6 +134,60 @@ public sealed class LaunchPreferenceResolverTests
         Assert.Equal(fixture.JunctionRoot, Assert.Single(plan.AdditionalTrackingRoots));
         Assert.DoesNotContain("D:\\OldGame", string.Join('|', plan.PrimaryProcess.Arguments), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("E:\\OldMTool", string.Join('|', plan.PrimaryProcess.Arguments), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Translation_mode_uses_MTool_Game_exe_when_no_paired_translation_exists()
+    {
+        using var fixture = new LaunchFixture();
+        var gameExecutable = fixture.CreateGameFile("Game.exe");
+        var mtoolGameExecutable = fixture.CreateGameFile("MTool_Game.exe");
+
+        var plan = fixture.Resolver.Resolve(
+            "game-translated-mtool", gameExecutable, fixture.GameRoot,
+            new VgcSettings { DefaultLaunchMode = "TranslationPreferred" });
+
+        Assert.Equal(VgcLaunchMode.TranslationPreferred, plan.Mode);
+        Assert.Equal(mtoolGameExecutable, plan.PrimaryProcess.FileName);
+        Assert.False(plan.UseRequestArguments);
+    }
+
+    [Fact]
+    public void Translation_mode_keeps_paired_translation_ahead_of_MTool_Game_exe()
+    {
+        using var fixture = new LaunchFixture();
+        var gameExecutable = fixture.CreateGameFile("Game.exe");
+        var translatedExecutable = fixture.CreateGameFile("Game_CHS.exe");
+        fixture.CreateGameFile("MTool_Game.exe");
+
+        var plan = fixture.Resolver.Resolve(
+            "game-translation-first", gameExecutable, fixture.GameRoot,
+            new VgcSettings { DefaultLaunchMode = "TranslationPreferred" });
+
+        Assert.Equal(translatedExecutable, plan.PrimaryProcess.FileName);
+        Assert.True(plan.UseRequestArguments);
+    }
+
+    [Fact]
+    public void Mtool_mode_prefers_recognized_batch_over_cached_MTool_Game_exe()
+    {
+        using var fixture = new LaunchFixture();
+        var gameExecutable = fixture.CreateGameFile("Game.exe");
+        var mtoolGameExecutable = fixture.CreateGameFile("MTool_Game.exe");
+        fixture.CreateMToolTemplate("Game.exe", "PythonHook64.dll");
+        var mtoolExecutable = fixture.CreateMToolInstallation("PythonHook64.dll");
+
+        var plan = fixture.Resolver.Resolve(
+            "game-mtool-exe",
+            gameExecutable,
+            fixture.GameRoot,
+            new VgcSettings { DefaultLaunchMode = "MTool", MToolExecutablePath = mtoolExecutable });
+
+        Assert.Equal(VgcLaunchMode.MTool, plan.Mode);
+        Assert.NotEqual(mtoolGameExecutable, plan.PrimaryProcess.FileName);
+        Assert.Equal(gameExecutable, plan.TrackedExecutablePath);
+        Assert.Single(plan.SecondaryProcesses);
+        Assert.False(plan.UseOriginalScript);
     }
 
 

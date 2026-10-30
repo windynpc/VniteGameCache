@@ -1,5 +1,7 @@
 # Cache System
 
+Archive-source games use the same persistent SSD cache goal. Their first launch requires per-game extraction and validation; subsequent launches from a Ready cache do not re-extract. Any archive extraction must use a single-game staging directory, reject unsafe member paths, verify the selected executable, and protect local-only mutable data before replacing an existing Ready cache. This flow is planned and must not be routed through the directory-source Robocopy service.
+
 ## 基本模型
 
 - NAS：完整游戏主库
@@ -326,6 +328,8 @@ Config-like user data is optional:
 Quarantine restore is allowed only when the original cache root is absent or empty.
 
 Manual safe clear intentionally keeps full-cache quarantine semantics. If quarantine is on the same SSD as the cache root, it is recoverable but does not immediately increase Windows available space. Space is only truly released when quarantine is on another disk/NAS, or when expired quarantine is permanently deleted.
+
+For an archive-backed game, the extracted files may sit under one or more top-level folders inside the cache root. Manual safe clear must also inspect the selected executable's working directory for the existing save-data path hints before it can move the cache to quarantine. Existing directory-backed games keep their current detection scope. This protects common archive layouts such as `<cache>/<archive folder>/save` without scanning the NAS or changing automatic cleanup behavior.
 
 Control Panel maintenance actions must use the same Agent/cache-management safety path. Even test or duplicate-cache cleanup must not call recursive directory deletion directly; it should force a safe clear, create a quarantine record when a cache directory exists, and then remove only the selected test database row.
 

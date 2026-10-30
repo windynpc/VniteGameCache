@@ -37,6 +37,16 @@ public static class AgentProgram
             return await LibraryImportCliAsync(args);
         }
 
+        if (args.Length > 0 && args[0].Equals("archive-preview", StringComparison.OrdinalIgnoreCase))
+        {
+            return await ArchivePreviewCliAsync(args);
+        }
+
+        if (args.Length > 0 && args[0].Equals("archive-import", StringComparison.OrdinalIgnoreCase))
+        {
+            return await ArchiveImportCliAsync(args);
+        }
+
         if (args.Length > 0 && args[0].Equals("game-upsert", StringComparison.OrdinalIgnoreCase))
         {
             return await GameUpsertCliAsync(args);
@@ -212,7 +222,8 @@ public static class AgentProgram
             var game = factory is null ? null : new GameRepository(factory).GetById(request.GameId);
             if (game is not null)
             {
-                var indexError = EnsureFreshIndexForPrepareLaunch(factory!, game, cancellation.Token);
+                var archiveSource = new ArchiveSourceRepository(factory!).GetByGameId(game.GameId);
+                var indexError = archiveSource is null ? EnsureFreshIndexForPrepareLaunch(factory!, game, cancellation.Token) : null;
                 if (indexError is not null)
                 {
                     taskRepository?.UpdateState(taskId, TaskState.Failed, indexError.Value.Code, indexError.Value.Message);
@@ -220,8 +231,10 @@ public static class AgentProgram
                     return 21;
                 }
 
-                var cache = CreateCacheService(factory!, ReadMinimumFreeSpace());
-                var cacheResult = await cache.PrepareCacheAsync(new CacheRequest(request.RequestId, request.GameId), cancellation.Token);
+                var cacheResult = archiveSource is null
+                    ? await CreateCacheService(factory!, ReadMinimumFreeSpace()).PrepareCacheAsync(
+                        new CacheRequest(request.RequestId, request.GameId), cancellation.Token)
+                    : await ArchiveCachePreparer.PrepareAsync(game, archiveSource, ReadMinimumFreeSpace(), cancellation.Token);
                 if (cacheResult.Status is not (CacheResultStatus.Success or CacheResultStatus.CacheAlreadyReady))
                 {
                     var errorCode = cacheResult.ErrorCode ?? cacheResult.Status.ToString();
@@ -233,7 +246,13 @@ public static class AgentProgram
 
                 var gameRepository = new GameRepository(factory!);
                 var latestGame = gameRepository.GetById(game.GameId) ?? game;
-                gameRepository.Update(latestGame with { LastPlayedUtc = DateTimeOffset.UtcNow, UpdatedUtc = DateTimeOffset.UtcNow });
+                var now = DateTimeOffset.UtcNow;
+                gameRepository.Update(latestGame with {
+                    CacheStatus = archiveSource is null ? latestGame.CacheStatus : CacheStatus.Ready,
+                    CacheSizeBytes = archiveSource is null ? latestGame.CacheSizeBytes : archiveSource.ExpandedBytes,
+                    LastCacheRefreshUtc = archiveSource is null ? latestGame.LastCacheRefreshUtc : now,
+                    LastPlayedUtc = now, UpdatedUtc = now
+                });
 
                 var cachedResponse = new PrepareLaunchResponse
                 {
@@ -417,20 +436,30 @@ public static class AgentProgram
         var minimumFreeSpace = long.TryParse(ReadOption(args, "--minimum-free-space-bytes"), out var parsedMinimum)
             ? parsedMinimum
             : ReadMinimumFreeSpace();
-        var service = CreateCacheService(factory, minimumFreeSpace);
         var game = new GameRepository(factory).GetById(gameId);
+        var archiveSource = game is null ? null : new ArchiveSourceRepository(factory).GetByGameId(game.GameId);
         if (game is not null)
         {
-            var indexError = EnsureFreshIndexForPrepareLaunch(factory, game, cancellation.Token);
+            var indexError = archiveSource is null ? EnsureFreshIndexForPrepareLaunch(factory, game, cancellation.Token) : null;
             if (indexError is not null)
             {
                 await Console.Error.WriteLineAsync(indexError.Value.Message);
                 return 20;
             }
         }
-        var result = await service.PrepareCacheAsync(
-            new CacheRequest(Guid.NewGuid(), gameId, forceRefresh, verification),
-            cancellation.Token);
+        var result = game is not null && archiveSource is not null
+            ? await ArchiveCachePreparer.PrepareAsync(game, archiveSource, minimumFreeSpace, cancellation.Token)
+            : await CreateCacheService(factory, minimumFreeSpace).PrepareCacheAsync(
+                new CacheRequest(Guid.NewGuid(), gameId, forceRefresh, verification), cancellation.Token);
+        if (game is not null && archiveSource is not null &&
+            result.Status is CacheResultStatus.Success or CacheResultStatus.CacheAlreadyReady)
+        {
+            new GameRepository(factory).Update(game with {
+                CacheStatus = CacheStatus.Ready,
+                CacheSizeBytes = archiveSource.ExpandedBytes,
+                LastCacheRefreshUtc = DateTimeOffset.UtcNow
+            });
+        }
         var resultJsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
         resultJsonOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter());
         await Console.Out.WriteLineAsync(JsonSerializer.Serialize(result, resultJsonOptions));
@@ -499,6 +528,167 @@ public static class AgentProgram
         var import = new LibraryImportService(games).Import(config, dryRun.Candidates, importNeedsConfirmation);
         await WriteJsonAsync(import);
         return import.ImportedGames.Count > 0 ? 0 : 20;
+    }
+
+    private static async Task<int> ArchivePreviewCliAsync(string[] args)
+    {
+        var archivePath = RequireOption(args, "--archive-path");
+        var sevenZip = Environment.GetEnvironmentVariable("VGC_7ZIP_PATH") ?? @"C:\Program Files\7-Zip\7z.exe";
+        var preview = await ArchivePreview.ReadAsync(archivePath, sevenZip);
+        await WriteJsonAsync(preview);
+        return preview.Supported ? 0 : 20;
+    }
+
+    private static async Task<int> ArchiveImportCliAsync(string[] args)
+    {
+        var archivePath = Path.GetFullPath(RequireOption(args, "--archive-path"));
+        var cacheBase = Path.GetFullPath(RequireOption(args, "--cache-root"));
+        var selectedExecutable = RequireOption(args, "--executable-relative-path").Replace('\\', '/');
+        var sevenZip = Environment.GetEnvironmentVariable("VGC_7ZIP_PATH") ?? @"C:\Program Files\7-Zip\7z.exe";
+        var preview = await ArchivePreview.ReadAsync(archivePath, sevenZip);
+        if (!preview.Supported || !preview.ExecutableCandidates.Contains(selectedExecutable, StringComparer.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(new { success = false, error = "archive_preview_invalid", preview });
+            return 20;
+        }
+        var archiveInfo = new FileInfo(archivePath);
+
+        var factory = OpenFactory(args);
+        var games = new GameRepository(factory);
+        var sources = new ArchiveSourceRepository(factory);
+        var gameId = CandidateIds.GameIdFromSourceRoot(archivePath);
+        var existing = games.GetById(gameId);
+        if (existing is not null)
+        {
+            var existingSource = sources.GetByGameId(gameId);
+            if (existingSource is null ||
+                !string.Equals(existingSource.ArchivePath, archivePath, StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(new { success = false, error = "archive_identity_conflict", game_id = gameId });
+                return 20;
+            }
+            var changed = existingSource.ArchiveSizeBytes != archiveInfo.Length ||
+                existingSource.ArchiveLastWriteUtc.UtcDateTime != archiveInfo.LastWriteTimeUtc ||
+                existingSource.FileCount != preview.FileCount ||
+                existingSource.ExpandedBytes != preview.ExpandedBytes ||
+                !string.Equals(existingSource.ExecutableRelativePath, selectedExecutable, StringComparison.OrdinalIgnoreCase);
+            if (changed)
+            {
+                if (Directory.Exists(existing.CacheRoot) && Directory.EnumerateFileSystemEntries(existing.CacheRoot).Any())
+                {
+                    await WriteJsonAsync(new { success = false, error = "archive_cache_requires_review",
+                        message = "旧缓存非空。请先备份存档并使用单游戏安全清理，再重新导入这个压缩包。", game_id = gameId });
+                    return 20;
+                }
+                var newExecutable = Path.GetFullPath(Path.Combine(existing.CacheRoot,
+                    selectedExecutable.Replace('/', Path.DirectorySeparatorChar)));
+                if (!newExecutable.StartsWith(existing.CacheRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(new { success = false, error = "invalid_executable_path" });
+                    return 20;
+                }
+                var updatedSource = existingSource with {
+                    ExecutableRelativePath = selectedExecutable,
+                    ExpandedBytes = preview.ExpandedBytes,
+                    FileCount = preview.FileCount,
+                    ArchiveSizeBytes = archiveInfo.Length,
+                    ArchiveLastWriteUtc = archiveInfo.LastWriteTimeUtc
+                };
+                sources.Upsert(updatedSource);
+                try
+                {
+                    games.Update(existing with {
+                        ExecutablePath = newExecutable,
+                        ExecutableRelativePath = selectedExecutable,
+                        WorkingDirectory = Path.GetDirectoryName(newExecutable)!,
+                        WorkingDirectoryRelativePath = Path.GetRelativePath(existing.CacheRoot, Path.GetDirectoryName(newExecutable)!).Replace('\\', '/'),
+                        CacheStatus = CacheStatus.NotCached,
+                        CacheSizeBytes = 0
+                    });
+                }
+                catch
+                {
+                    sources.Upsert(existingSource);
+                    throw;
+                }
+            }
+            Directory.CreateDirectory(existing.CacheRoot);
+            await WriteJsonAsync(new
+            {
+                success = true,
+                already_imported = !changed,
+                refreshed = changed,
+                imported_games = new[] { new {
+                    game_id = existing.GameId, source_root = existing.SourceRoot, archive_path = archivePath,
+                    display_name = existing.DisplayName, cache_root = existing.CacheRoot,
+                    executable_path = changed ? Path.Combine(existing.CacheRoot, selectedExecutable.Replace('/', Path.DirectorySeparatorChar)) : existing.ExecutablePath,
+                    launch_mode = "Direct"
+                } }
+            });
+            return 0;
+        }
+
+        var name = ReadOption(args, "--display-name") ?? Path.GetFileNameWithoutExtension(archivePath);
+        var cacheRoot = CacheRootBuilder.Build(cacheBase, name, gameId);
+        if (!cacheRoot.StartsWith(cacheBase.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(new { success = false, error = "invalid_cache_root" });
+            return 20;
+        }
+        var executable = Path.GetFullPath(Path.Combine(cacheRoot, selectedExecutable.Replace('/', Path.DirectorySeparatorChar)));
+        if (!executable.StartsWith(cacheRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(new { success = false, error = "invalid_executable_path" });
+            return 20;
+        }
+        Directory.CreateDirectory(cacheRoot);
+
+        var now = DateTimeOffset.UtcNow;
+        var game = new GameRecord
+        {
+            GameId = gameId,
+            VniteGameId = gameId,
+            DisplayName = name,
+            SourceRoot = Path.GetDirectoryName(archivePath)!,
+            CacheRoot = cacheRoot,
+            ExecutablePath = executable,
+            WorkingDirectory = Path.GetDirectoryName(executable)!,
+            ExecutableRelativePath = selectedExecutable,
+            WorkingDirectoryRelativePath = Path.GetRelativePath(cacheRoot, Path.GetDirectoryName(executable)!).Replace('\\', '/'),
+            CreatedUtc = now,
+            UpdatedUtc = now
+        };
+        games.Create(game);
+        try
+        {
+            sources.Upsert(new ArchiveSourceRecord
+            {
+                GameId = gameId,
+                ArchivePath = archivePath,
+                ExecutableRelativePath = selectedExecutable,
+                ExpandedBytes = preview.ExpandedBytes,
+                FileCount = preview.FileCount,
+                ArchiveSizeBytes = archiveInfo.Length,
+                ArchiveLastWriteUtc = archiveInfo.LastWriteTimeUtc
+            });
+        }
+        catch
+        {
+            games.Delete(gameId);
+            throw;
+        }
+        await WriteJsonAsync(new
+        {
+            success = true,
+            imported_games = new[] { new {
+                game_id = gameId, source_root = game.SourceRoot, archive_path = archivePath,
+                display_name = name, cache_root = cacheRoot, executable_path = executable, launch_mode = "Direct"
+            } }
+        });
+        return 0;
     }
 
     private static async Task<int> GameUpsertCliAsync(string[] args)
@@ -599,6 +789,28 @@ public static class AgentProgram
         {
             await WriteJsonAsync(new { success = true, deleted = false, game_id = gameId, status = "not_found" });
             return 0;
+        }
+
+        var activeQuarantine = new QuarantineRepository(factory).ListByGame(record.GameId)
+            .Where(entry => entry.RestoredUtc is null && entry.DeletedUtc is null)
+            .ToArray();
+        if (activeQuarantine.Length > 0)
+        {
+            await WriteJsonAsync(new
+            {
+                success = false,
+                deleted = false,
+                game_id = record.GameId,
+                status = "active_quarantine",
+                quarantine_paths = activeQuarantine.Select(entry => entry.QuarantinePath).ToArray()
+            });
+            return 2;
+        }
+
+        if (new SaveProfileRepository(factory).ListByGame(record.GameId).Count > 0)
+        {
+            await WriteJsonAsync(new { success = false, deleted = false, game_id = record.GameId, status = "save_profiles_present" });
+            return 2;
         }
 
         repository.Delete(record.GameId);

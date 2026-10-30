@@ -5,11 +5,14 @@ const os = require('os')
 const path = require('path')
 
 const pluginId = 'vnite-game-cache'
+const managedLauncherPresetId = 'vgc-managed-entry'
 let apiRef = null
 let autoAdoptInterval = null
 let autoAdoptStartupTimeout = null
 let autoAdoptEventTimeout = null
 let autoAdoptRunning = false
+let autoArchiveInterval = null
+let autoArchiveStartupTimeout = null
 let autoCleanupInterval = null
 let autoCleanupRunning = false
 let controlCommandInterval = null
@@ -41,6 +44,7 @@ async function activate(api) {
   await api.PluginDB.setValue('lastActivationUtc', new Date().toISOString())
   await syncSharedSettings(api)
   await registerToolboxShortcuts(api)
+  await registerManagedLauncherPreset(api)
   if (isMaintenanceModeEnabled()) {
     await log('maintenance_mode_active', { reason: 'auto launch-route migration skipped' })
   } else {
@@ -77,6 +81,16 @@ async function activate(api) {
     const combined = { ...result, vnite_result: vniteResult }
     await api.PluginDB.setValue('lastLibraryImport', combined)
     return combined
+  })
+
+  api.ipc.handle('vgc:archive-preview', async (_event, payload) => {
+    const archivePath = String(payload?.archive_path || '').trim()
+    if (!archivePath) throw new Error('Archive path is required')
+    return await runAgentJson('archive-preview', ['--archive-path', archivePath])
+  })
+
+  api.ipc.handle('vgc:archive-import', async (_event, payload) => {
+    return await runArchiveImport(payload)
   })
 
   api.ipc.handle('vgc:launch-route-dry-run', async () => {
@@ -191,6 +205,7 @@ async function activate(api) {
   }
   scheduleAutoCacheCleanup()
   scheduleControlCommands()
+  scheduleAutoArchiveDiscovery()
 
   const autoRun = await api.PluginDB.getValue('autoRunValidationOnActivate', false)
   if (autoRun) {
@@ -210,6 +225,14 @@ async function activate(api) {
 }
 
 async function deactivate(api) {
+  if (autoArchiveInterval) {
+    clearInterval(autoArchiveInterval)
+    autoArchiveInterval = null
+  }
+  if (autoArchiveStartupTimeout) {
+    clearTimeout(autoArchiveStartupTimeout)
+    autoArchiveStartupTimeout = null
+  }
   if (autoAdoptInterval) {
     clearInterval(autoAdoptInterval)
     autoAdoptInterval = null
@@ -236,6 +259,8 @@ async function deactivate(api) {
     api.ipc.removeHandler('vgc:get-last-result')
     api.ipc.removeHandler('vgc:library-dry-run')
     api.ipc.removeHandler('vgc:library-import')
+    api.ipc.removeHandler('vgc:archive-preview')
+    api.ipc.removeHandler('vgc:archive-import')
     api.ipc.removeHandler('vgc:launch-route-dry-run')
     api.ipc.removeHandler('vgc:launch-route-apply')
     api.ipc.removeHandler('vgc:launch-route-restore')
@@ -428,6 +453,36 @@ async function registerToolboxShortcuts(api) {
   })
 }
 
+async function registerManagedLauncherPreset(api) {
+  const configDb = api.ConfigDB
+  if (!configDb || typeof configDb.getConfigLocalValue !== 'function' || typeof configDb.setConfigLocalValue !== 'function') return
+
+  try {
+    const presets = await configDb.getConfigLocalValue('game.launcher.presets')
+    if (!Array.isArray(presets)) return
+    if (presets.some((preset) => preset?.id === managedLauncherPresetId)) {
+      await log('managed_launcher_preset_present', { preset_id: managedLauncherPresetId })
+      return
+    }
+
+    await configDb.setConfigLocalValue('game.launcher.presets', [...presets, {
+      id: managedLauncherPresetId,
+      name: 'VGC 接管入口（仅已接管游戏）',
+      mode: 'file',
+      path: '${vnite.gamePath}',
+      monitorMode: 'process',
+      monitorPath: 'VniteGameCache.Wrapper'
+    }])
+    const savedPresets = await configDb.getConfigLocalValue('game.launcher.presets')
+    if (!Array.isArray(savedPresets) || !savedPresets.some((preset) => preset?.id === managedLauncherPresetId)) {
+      throw new Error('Vnite launcher preset readback failed')
+    }
+    await log('managed_launcher_preset_registered', { preset_id: managedLauncherPresetId })
+  } catch (error) {
+    await log('managed_launcher_preset_registration_failed', { message: error.message })
+  }
+}
+
 function createExplorerTool(name, explorerPath, targetPath) {
   return {
     name,
@@ -484,6 +539,93 @@ function scheduleAutoAdoptExisting() {
   autoAdoptInterval = setInterval(() => {
     runAutoAdoptExisting('periodic_reconcile_15m')
   }, 15 * 60_000)
+}
+
+function scheduleAutoArchiveDiscovery() {
+  if (autoArchiveInterval || autoArchiveStartupTimeout) return
+  autoArchiveStartupTimeout = setTimeout(() => {
+    autoArchiveStartupTimeout = null
+    runAutoArchiveDiscovery().catch((error) => log('archive_discovery_failed', { error: error.message }))
+  }, 30_000)
+  autoArchiveInterval = setInterval(() => {
+    runAutoArchiveDiscovery().catch((error) => log('archive_discovery_failed', { error: error.message }))
+  }, 15 * 60_000)
+}
+
+function archiveDiscoveryCandidates(root, checkpoint, limit = 20) {
+  const entries = fs.readdirSync(root, { withFileTypes: true })
+  const candidates = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !/\.(zip|7z|rar)$/i.test(entry.name) || /\.part\d+\.rar$/i.test(entry.name)) continue
+    const archivePath = path.join(root, entry.name)
+    const stat = fs.statSync(archivePath)
+    const signature = `${stat.size}:${stat.mtimeMs}`
+    if (checkpoint[archivePath] === signature) continue
+    candidates.push({ archivePath, signature })
+  }
+  return candidates.sort((a, b) => a.archivePath.localeCompare(b.archivePath)).slice(0, limit)
+}
+
+function isAutomaticArchiveExecutable(candidate) {
+  const name = path.basename(String(candidate || '').replace(/\\/g, '/'))
+  return /\.exe$/i.test(name) && !/(?:^|[._ -])(setup|install|uninstall|update|config|launcher|卸载|安装|配置)(?:[._ -]|$)/i.test(name)
+}
+
+async function runAutoArchiveDiscovery() {
+  if (autoAdoptRunning || !apiRef || isMaintenanceModeEnabled() ||
+      !(await apiRef.PluginDB.getValue('autoDiscoverArchives', false))) return
+  const root = String(await apiRef.PluginDB.getValue('libraryRoot', '') || '').trim()
+  if (!root || !fs.existsSync(root)) return
+  const cacheRoot = String(await apiRef.PluginDB.getValue('defaultCacheRoot', '') || '').trim()
+  if (!cacheRoot) return
+
+  autoAdoptRunning = true
+  try {
+    const checkpoint = await apiRef.PluginDB.getValue('archiveDiscoveryCheckpoint', {}) || {}
+    const found = archiveDiscoveryCandidates(root, checkpoint)
+    const results = []
+    for (const candidate of found) {
+      const existingId = await apiRef.PluginDB.getValue(`vniteGameId:${candidate.archivePath}`, '')
+      if (existingId) {
+        if (checkpoint[candidate.archivePath] && checkpoint[candidate.archivePath] !== candidate.signature) {
+          results.push({ archive_path: candidate.archivePath, status: 'source_changed_needs_review' })
+        }
+        checkpoint[candidate.archivePath] = candidate.signature
+        continue
+      }
+      const preview = await runAgentJson('archive-preview', ['--archive-path', candidate.archivePath])
+      const candidates = preview.result?.executable_candidates || []
+      if (preview.exit_code !== 0 || !preview.result?.supported || candidates.length !== 1 ||
+          !isAutomaticArchiveExecutable(candidates[0])) {
+        results.push({ archive_path: candidate.archivePath, status: 'needs_confirmation', executable_candidates: candidates })
+        checkpoint[candidate.archivePath] = candidate.signature
+        continue
+      }
+      const imported = await runArchiveImport({
+        archive_path: candidate.archivePath,
+        executable_relative_path: candidates[0],
+        cache_root: cacheRoot,
+        display_name: path.parse(candidate.archivePath).name
+      })
+      const applied = imported.exit_code === 0 && imported.vnite_result?.applied_count === 1
+      results.push({ archive_path: candidate.archivePath, status: applied ? 'imported' : 'failed', error: imported.result?.error || imported.vnite_result?.reason || '' })
+      if (applied) checkpoint[candidate.archivePath] = candidate.signature
+    }
+    await apiRef.PluginDB.setValue('archiveDiscoveryCheckpoint', checkpoint)
+    if (results.length) {
+      const previous = await apiRef.PluginDB.getValue('lastArchiveDiscovery', null)
+      const retained = new Map((previous?.root === root ? previous.results || [] : [])
+        .map((item) => [item.archive_path, item]))
+      for (const item of results) retained.set(item.archive_path, item)
+      const report = { root, results: [...retained.values()].slice(-200), timestamp_utc: new Date().toISOString() }
+      await apiRef.PluginDB.setValue('lastArchiveDiscovery', report)
+      fs.mkdirSync(getCommandsRoot(), { recursive: true })
+      fs.writeFileSync(path.join(getCommandsRoot(), 'archive-discovery-result.json'), JSON.stringify(report, null, 2), 'utf8')
+      await log('archive_discovery_finished', { root, results })
+    }
+  } finally {
+    autoAdoptRunning = false
+  }
 }
 
 function registerAutoAdoptEventAccelerators(api) {
@@ -682,6 +824,26 @@ async function runControlCommandRequest() {
     return
   }
 
+  const archiveRequestPath = path.join(getCommandsRoot(), 'archive-import-request.json')
+  if (fs.existsSync(archiveRequestPath)) {
+    const resultPath = path.join(getCommandsRoot(), 'archive-import-result.json')
+    let request
+    try {
+      request = JSON.parse(fs.readFileSync(archiveRequestPath, 'utf8'))
+      fs.rmSync(archiveRequestPath, { force: true })
+      autoAdoptRunning = true
+      const result = await runArchiveImport(request)
+      writeCommandResult(resultPath, { ...result, request_id: request.request_id, status: 'complete' })
+      await log('archive_import_finished', { exit_code: result.exit_code, applied_count: result.vnite_result?.applied_count || 0 })
+    } catch (error) {
+      writeCommandResult(resultPath, { request_id: request?.request_id, status: 'error', success: false, error: error.message })
+      await log('archive_import_failed', { error: error.message })
+    } finally {
+      autoAdoptRunning = false
+    }
+    return
+  }
+
   const consistencyRequestPath = path.join(getCommandsRoot(), 'takeover-consistency-request.json')
   if (fs.existsSync(consistencyRequestPath)) {
     let request = {}
@@ -725,6 +887,7 @@ async function runControlCommandRequest() {
 
   const clearRequestPath = path.join(getCommandsRoot(), 'clear-takeover-request.json')
   if (fs.existsSync(clearRequestPath)) {
+    const clearResultPath = path.join(getCommandsRoot(), 'clear-takeover-result.json')
     let request = {}
     try {
       request = JSON.parse(fs.readFileSync(clearRequestPath, 'utf8'))
@@ -743,6 +906,15 @@ async function runControlCommandRequest() {
         : { scan: await scanTakeoverResidue(request) }
       await apiRef.PluginDB.setValue('lastClearTakeoverProperties', { ...result, reason: 'control_panel_request' })
       writeTakeoverResidueDiagnostics(result.scan || result, 'control_panel_request')
+      writeCommandResult(clearResultPath, {
+        request_id: request.request_id,
+        requested_utc: request.requested_utc,
+        success: (result.failed_count || 0) === 0,
+        cleared_count: result.cleared_count || 0,
+        failed_count: result.failed_count || 0,
+        residue_count: result.scan?.residue_count || result.residue_count || 0,
+        error: result.failed?.[0]?.error || null
+      })
       await log('control_panel_clear_takeover_success', {
         apply,
         cleared_count: result.cleared_count || 0,
@@ -757,6 +929,7 @@ async function runControlCommandRequest() {
         residues: []
       }
       writeTakeoverResidueDiagnostics(failure, 'control_panel_request_failed')
+      writeCommandResult(clearResultPath, { request_id: request.request_id, requested_utc: request.requested_utc, success: false, error: error.message })
       await log('control_panel_clear_takeover_failed', { error: error.message })
     } finally {
       autoAdoptRunning = false
@@ -965,10 +1138,34 @@ function getCommandsRoot() {
   return path.join(getLocalAppDataRoot(), 'commands')
 }
 
+function writeCommandResult(resultPath, result) {
+  const tempPath = `${resultPath}.${process.pid}.${crypto.randomUUID()}.tmp`
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(result, null, 2), 'utf8')
+    fs.renameSync(tempPath, resultPath)
+  } finally {
+    fs.rmSync(tempPath, { force: true })
+  }
+}
+
 function mbToBytes(value) {
   const number = Number(value)
   if (!Number.isFinite(number) || number <= 0) return 0
   return Math.floor(number * 1024 * 1024)
+}
+
+async function runArchiveImport(payload) {
+  const archivePath = String(payload?.archive_path || '').trim()
+  const executablePath = String(payload?.executable_relative_path || '').trim()
+  const cacheRoot = String(payload?.cache_root || (await apiRef.PluginDB.getValue('defaultCacheRoot', ''))).trim()
+  if (!archivePath || !executablePath || !cacheRoot) throw new Error('Archive, executable and cache root are required')
+  const guard = validateAdoptRoot(archivePath, await getExistingAdoptRoots({}))
+  if (!guard.allowed) throw new Error(`Archive is outside configured game roots: ${guard.reason}`)
+  const args = ['--archive-path', archivePath, '--executable-relative-path', executablePath, '--cache-root', cacheRoot]
+  if (payload?.display_name) args.push('--display-name', String(payload.display_name))
+  const result = await runAgentJson('archive-import', args)
+  if (result.exit_code !== 0) return result
+  return { ...result, vnite_result: await tryApplyVniteEntries(result) }
 }
 
 async function tryApplyVniteEntries(importResult) {
@@ -1019,12 +1216,15 @@ function createVniteGameLibraryAdapter(gameDb) {
       const wrapperPath = await getWrapperLauncherPath()
       await validateWrapperLauncherPath(wrapperPath)
       const roots = await getExistingAdoptRoots({})
-      const guard = validateAdoptRoot(game.source_root, roots)
+      const guard = validateAdoptRoot(game.archive_path || game.source_root, roots)
       if (!guard.allowed) {
         throw new Error(`Refusing to import Vnite entry outside configured roots: ${guard.reason}`)
       }
       const allGames = await gameDb.getAllGames()
       const existingGame = allGames[game.game_id] || null
+      if (game.archive_path && existingGame && !isManagedGame(existingGame)) {
+        throw new Error(`Archive Game ID already belongs to an unmanaged Vnite entry: ${game.game_id}`)
+      }
       let gameDoc = existingGame
       if (!existingGame) {
         gameDoc = createVniteGameDoc(game)
@@ -1039,9 +1239,10 @@ function createVniteGameLibraryAdapter(gameDb) {
         'import'
       )
       emitGameAdded(game.game_id, gameDoc)
-      await apiRef.PluginDB.setValue(`vniteGameId:${game.source_root}`, game.game_id)
+      await apiRef.PluginDB.setValue(`vniteGameId:${game.archive_path || game.source_root}`, game.game_id)
       await apiRef.PluginDB.setValue(`internalGameId:${game.game_id}`, {
         source_root: game.source_root,
+        archive_path: game.archive_path || '',
         cache_root: game.cache_root,
         executable_path: game.executable_path,
         launch_mode: game.launch_mode,
@@ -1273,7 +1474,7 @@ function emitGameAdded(gameId, gameDoc) {
 }
 
 function createVniteGameDoc(game) {
-  const title = path.basename(game.source_root)
+  const title = game.display_name || path.basename(game.source_root)
   return {
     _id: game.game_id,
     metadata: {
@@ -1328,6 +1529,7 @@ function createVniteGameDoc(game) {
 }
 
 function createSourceGameLocalDoc(game) {
+  const gameRoot = game.archive_path ? game.cache_root : game.source_root
   return {
     _id: game.game_id,
     path: {
@@ -1350,7 +1552,7 @@ function createSourceGameLocalDoc(game) {
         monitorPath: ''
       },
       scriptConfig: {
-        workingDirectory: game.source_root,
+        workingDirectory: gameRoot,
         command: [],
         monitorMode: 'file',
         monitorPath: game.executable_path
@@ -1358,8 +1560,8 @@ function createSourceGameLocalDoc(game) {
       useMagpie: false
     },
     utils: {
-      markPath: game.source_root,
-      rootPath: game.source_root
+      markPath: gameRoot,
+      rootPath: gameRoot
     }
   }
 }
@@ -1404,8 +1606,8 @@ async function createWrapperManagedGameLocalDoc(game, wrapperPath, existingLocal
   }
   nextLocal.utils = {
     ...(nextLocal.utils || {}),
-    markPath: game.source_root,
-    rootPath: game.source_root
+    markPath: game.archive_path ? game.cache_root : game.source_root,
+    rootPath: game.archive_path ? game.cache_root : game.source_root
   }
   return nextLocal
 }
@@ -1447,6 +1649,7 @@ async function migrateLaunchRoutes({ apply }) {
       source_root:
         internal?.source_root ||
         getLocalSourceRoot(backupLocal, executablePath),
+      archive_path: internal?.archive_path || '',
       cache_root: internal?.cache_root || '',
       executable_path: executablePath,
       launch_mode: internal?.launch_mode || 'Direct'
@@ -1527,6 +1730,7 @@ async function adoptExistingVniteGames({ apply, payload }) {
     stats.scanned++
     const local = await safeGetGameLocal(gameDb, gameId)
     const internal = await apiRef.PluginDB.getValue(`internalGameId:${gameId}`, null)
+    if (internal?.archive_path) continue
     const sqliteRecord = sqlite.byGameId.get(gameId.toLowerCase()) || sqlite.byVniteGameId.get(gameId.toLowerCase()) || null
     const takeoverEvidence = findVgcTakeoverEvidence(local, wrapperPath, gameId)
     if (takeoverEvidence.has_takeover) {
@@ -2080,7 +2284,7 @@ async function clearTakeoverProperties({ apply, payload }) {
     return { mode: 'apply', cleared_count: 0, failed: [], scan, reason: 'GameDB is unavailable' }
   }
 
-  const selected = scan.residues || []
+  const selected = selectClearTakeoverTargets(scan)
   const cleared = []
   const failed = []
   for (const item of selected) {
@@ -2102,6 +2306,9 @@ async function clearTakeoverProperties({ apply, payload }) {
       let deleteResult = null
       if (payload.delete_plugin_record) {
         deleteResult = await runAgentJson('game-delete', ['--game-id', item.game_id])
+        if (deleteResult.exit_code !== 0 || deleteResult.result?.success !== true) {
+          throw new Error(`VGC record delete failed: ${deleteResult.stderr || deleteResult.stdout || deleteResult.exit_code}`)
+        }
       }
       cleared.push({
         game_id: item.game_id,
@@ -2138,6 +2345,10 @@ async function clearTakeoverProperties({ apply, payload }) {
     readopt,
     timestamp_utc: new Date().toISOString()
   }
+}
+
+function selectClearTakeoverTargets(scan) {
+  return [...(scan.residues || []), ...(scan.normal_managed || [])]
 }
 
 async function getWrapperLauncherPath() {
@@ -2465,6 +2676,7 @@ async function clearPluginDbTakeoverKeys(gameId, internal, local) {
   await apiRef.PluginDB.setValue(launchBackupKey(gameId), null)
   const roots = [
     internal?.source_root,
+    internal?.archive_path,
     local?.utils?.rootPath,
     local?.utils?.markPath
   ].filter(Boolean)
@@ -3446,6 +3658,7 @@ module.exports = {
   activate,
   deactivate,
   __test: {
+    writeCommandResult,
     trimLogs,
     appendLog,
     maximumLogTotalBytes,
@@ -3455,6 +3668,7 @@ module.exports = {
     findVgcTakeoverEvidence,
     valueLooksVgcTakeover,
     createClearedTakeoverLocalDoc,
+    selectClearTakeoverTargets,
     isWrapperManagedLocalDocComplete,
     isInternalGameSnapshotCurrent,
     isGameLocalWriteVerified,
@@ -3462,7 +3676,9 @@ module.exports = {
     mapAdoptSkipToConsistencyStatus,
     buildLaunchArguments,
     parseLaunchArguments,
-    normalizeLaunchGameId
+    normalizeLaunchGameId,
+    archiveDiscoveryCandidates,
+    isAutomaticArchiveExecutable
   }
 }
 

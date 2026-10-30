@@ -10,7 +10,7 @@ public sealed class StructuredLogger(string? configuredLogDirectory)
             "VniteGameCache",
             "logs");
 
-    public Task WriteAsync(
+    public async Task WriteAsync(
         LaunchRequest request,
         string component,
         string eventName,
@@ -19,6 +19,7 @@ public sealed class StructuredLogger(string? configuredLogDirectory)
         string result,
         string? error)
     {
+        Directory.CreateDirectory(_logDirectory);
         var entry = new Dictionary<string, object?>
         {
             ["request_id"] = request.RequestId,
@@ -33,7 +34,6 @@ public sealed class StructuredLogger(string? configuredLogDirectory)
         };
 
         var path = Path.Combine(_logDirectory, $"{DateTimeOffset.UtcNow:yyyyMMdd}.jsonl");
-        LogRetention.Append(path, ProtocolJson.Serialize(entry) + Environment.NewLine, LogRetention.Roots(_logDirectory));
-        return Task.CompletedTask;
+        await File.AppendAllTextAsync(path, ProtocolJson.Serialize(entry) + Environment.NewLine);
     }
 }

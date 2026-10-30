@@ -250,7 +250,12 @@ public sealed class LibraryImportService(GameRepository games)
 public static class CandidateIds
 {
     public static string FromSourceRoot(string sourceRoot) => "candidate-" + ShortHash(Normalize(sourceRoot), 16);
-    public static string GameIdFromSourceRoot(string sourceRoot) => "vgc-" + ShortHash(Normalize(sourceRoot), 16);
+    public static string GameIdFromSourceRoot(string sourceRoot)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(Normalize(sourceRoot)));
+        var hex = Convert.ToHexString(hash.AsSpan(0, 16)).ToLowerInvariant();
+        return $"{hex[..8]}-{hex[8..12]}-{hex[12..16]}-{hex[16..20]}-{hex[20..32]}";
+    }
 
     private static string Normalize(string path) => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToUpperInvariant();
     private static string ShortHash(string value, int length)
